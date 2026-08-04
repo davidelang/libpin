@@ -1,0 +1,12 @@
+# pin local state
+**/status.local
+# materialized sources (recreate with fetch-deps)
+**/src/
+# allow documenting seeds; ignore build products
+**/artifact/*.bin
+!examples/**/seed/**
+*.pyc
+__pycache__/
+.DS_Store
+*.swp
+*~
