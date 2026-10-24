@@ -13,8 +13,8 @@ Companion kit stamp: `kit/VERSION` must match the `LIBPIN_VERSION` embedded in e
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
 | `name` | string | yes | Library id; directory name under `third_party/` |
-| `git_https` | string | for network git pins | HTTPS clone URL (the only network transport) |
-| `git_ssh` | string | optional | Recorded metadata; the tool never uses it |
+| `git_https` | string | for network git pins | HTTPS clone URL (preferred network transport; agents use this first) |
+| `git_ssh` | string | optional | SSH clone URL; used when `git_https` is unset |
 | `git_sha` | string | for git pins | Locked commit (full SHA preferred; partial SHAs accepted if unique) |
 | `git_describe` | string | optional | Human label (tag / describe); updated with `git_sha` on refresh/upgrade |
 | `track_branch` | string | optional | Branch **or** tag the pin tracks (see below) |
@@ -42,15 +42,16 @@ A leftover `@@GIT_HOME@@` (or any `@@…@@`) token in `git_home` / `host_repo` i
 
 ### Git transport policy
 
-- **Network:** `git_https` only. `git_ssh` is recorded so humans still see the SSH URL; fetch-deps never clones or fetches over SSH.
-- A pin with only `git_ssh` (no host, no `git_https`, not `source_kind = "seed-src"`) fails.
+- A local host clone (`GIT_HOME` / `host_repo`) is an **optional offline shortcut**, never mandatory.
+- **Network:** `git_https` if set, else `git_ssh`. Agents typically succeed on HTTPS; SSH may need David’s keys.
+- If the host shortcut is missing or unreadable, fetch-deps uses the remote URL and prints the `chown` / `chmod` / `setfacl` / `ssh` command David can run.
 - File `[[source]]` URLs **never** use SSH (`https://`, `http://`, `file:relative`, `file:///abs` only). curl is the only HTTP client.
 
 ### `source_kind`
 
 | Value | Materialize |
 |-------|-------------|
-| omitted / git | git at `git_sha` (host clone, else `git_https`) |
+| omitted / git | git at `git_sha` (host shortcut if usable, else `git_https`, else `git_ssh`, else seed-src) |
 | `"files"` | `[[source]]` rows only (seed or url + sha256) |
 | `"seed-src"` | run `./seed-src` in the pin dir; empty `git_https` does **not** imply this |
 
@@ -60,24 +61,32 @@ A leftover `@@GIT_HOME@@` (or any `@@…@@`) token in `git_home` / `host_repo` i
 
 | Situation | Result |
 |-----------|--------|
-| `host_repo` present, name (not absolute) | `GIT_HOME` required; host is `$GIT_HOME/<name>` |
+| `host_repo` present, name (not absolute), `GIT_HOME` set | shortcut `$GIT_HOME/<name>` if it is a readable git repo |
+| `host_repo` present, name, `GIT_HOME` unset | no shortcut; use `git_https` / `git_ssh` |
 | `host_repo` present, absolute path under `GIT_HOME` | error (use the name) |
-| `host_repo` present, absolute path outside `GIT_HOME` | must be a git repo |
-| `host_repo` absent, `GIT_HOME` set, `$GIT_HOME/<pin>` is a git repo | that host |
-| `host_repo` absent, `GIT_HOME` set, path exists but is not git | error |
-| `host_repo` absent, `GIT_HOME` set, path missing | no host (https / seed-src may run) |
-| `host_repo` absent, `GIT_HOME` unset | no host (https / files / seed-src may run) |
+| `host_repo` present, absolute path outside `GIT_HOME` | shortcut if it is a readable git repo; else remote |
+| `host_repo` absent, `GIT_HOME` set, `$GIT_HOME/<pin>` is a readable git repo | that shortcut |
+| `host_repo` absent, path exists but is not git / not readable | skip shortcut, print why (chown/chmod/setfacl if permissions), use remote |
+| `host_repo` absent, `GIT_HOME` unset or path missing | no shortcut; use remote |
 | leftover `@@…@@` token | error |
 
-If `host_repo` is set **or** the resolved host is a git repo: **never network**. Missing commit is an error, not a fall-through to `git_https`.
+If the shortcut is a readable git repo that has the pin sha, clone from it (`--no-hardlinks`, no network). If it is missing, unreadable, or lacks the commit, use `git_https` or `git_ssh`. An unreadable host prints:
 
-Materialize from a host is `git clone --no-hardlinks --no-checkout` then `checkout --detach <sha>`. Linked worktrees and clones with alternates (`--shared`) are replaced. `origin` is `git_https` when present; remote `host` is the resolved path.
+```text
+David: chmod a+rX <host> && chmod -R a+rX <host>/.git
+or:    setfacl -R -m u:<agent>:rx <host>
+or:    chown -R dlang:dlang <host> && chmod -R a+rX <host>
+```
+
+An SSH failure prints `ssh -T`, `git clone <git_ssh> <src>`, `chmod` on `~/.ssh`, and an example `GIT_SSH_COMMAND=ssh -i …` for David.
+
+Materialize from a host is `git clone --no-hardlinks --no-checkout` then `checkout --detach <sha>`. Linked worktrees and clones with alternates (`--shared`) are replaced. `origin` is `git_https` or `git_ssh`; remote `host` is the resolved path when the shortcut exists.
 
 `--git-home DIR` overrides the smudged `git_home=` value. Consumers smudge lowercase `git_home=`; the kit does not hard-code a machine path.
 
 ### `track_branch`
 
-Looked up as `refs/tags/<name>` and `refs/heads/<name>` on the host. Both exist → error.
+Looked up as `refs/tags/<name>` and `refs/heads/<name>` on the host shortcut if usable, else via `git ls-remote` on `git_https` / `git_ssh`. Both exist → error.
 
 | Kind | `refresh` | `upgrade --ref` |
 |------|-----------|-----------------|
@@ -100,7 +109,7 @@ Omits the pin from fetch-deps and get-artifacts when no NAME arguments are given
 
 ```toml
 name = "opencv"
-git_ssh = "git@github.com:opencv/opencv.git"   # metadata only
+git_ssh = "git@github.com:opencv/opencv.git"   # used if git_https is unset
 git_https = "https://github.com/opencv/opencv.git"
 git_sha = "71d3237a093b60a27601c20e9ee6c3e52154e8b1"
 git_describe = "4.10.0"
@@ -253,4 +262,4 @@ Materialize fails if the source has a `.gitmodules` file or contains Git LFS poi
 ## `fetch-deps check` / `outdated`
 
 - **check:** `host_repo` validation; git_home leak warning (a committed `libpin.toml` containing the expanded `GIT_HOME` path means the clean filter did not run; `kit/hooks/pre-commit-git-home-leak` offers the same as a hook); `depends`; moved tags.
-- **outdated:** compare each pin with its upstream (host repo, or `track_branch` on `git_https`). Store the tip seen at the last check in `status.local`; report separately (a) upstream moved since the last check and (b) still behind with no new movement. Read-only apart from `status.local`.
+- **outdated:** compare each pin with its upstream (host shortcut if usable, else `track_branch` on `git_https` / `git_ssh`). Store the tip seen at the last check in `status.local`; report separately (a) upstream moved since the last check and (b) still behind with no new movement. Read-only apart from `status.local`.

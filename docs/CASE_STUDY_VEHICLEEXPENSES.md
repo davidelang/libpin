@@ -120,11 +120,11 @@ Same pin layout while actively editing library sources next to the app:
 
 ## Optional local git (`GIT_HOME`)
 
-Maintainers often keep full clones under `~/git/opencv`, `~/git/Paddle-Lite`, etc. When the host is a git repo, fetch-deps clones it with `--no-hardlinks` into `third_party/<lib>/src` and never uses the network. Host `.git` is read-only inside the sandbox (no `LIBPIN_HOST_GIT` RW bind). opencv’s object store is copied per worktree (~573M); that is accepted.
+Maintainers often keep full clones under `~/git/opencv`, `~/git/Paddle-Lite`, etc. When that host is a readable git repo, fetch-deps clones it with `--no-hardlinks` into `third_party/<lib>/src` (offline shortcut). If the host is missing or unreadable, it uses `git_https` / `git_ssh` and prints chown/chmod/setfacl/ssh commands for David. Host `.git` is read-only inside the sandbox (no `LIBPIN_HOST_GIT` RW bind). opencv’s object store is copied per worktree (~573M); that is accepted.
 
 `rclone` and `paddle` need `default = false` to stay out of the default NAME set. `paddle-opt` already has `host_repo = "paddle"`; its 64-zero sha256 must be filled by `--record`. `extractmail` should add `depends = ["remotetable"]`. opencv `track_branch = "4.10.0"` is a tag check (`refresh` fails if the tag moves; `upgrade --ref` to change it).
 
-Joe Random without `GIT_HOME` still materializes via HTTPS clone of the pin SHA (`git_https` only; `git_ssh` is metadata).
+Joe Random without `GIT_HOME` still materializes via `git_https`, or `git_ssh` if that is the only remote.
 
 ---
 

@@ -84,7 +84,7 @@ build = []
 
 ### Local full clone (`GIT_HOME`)
 
-Optional unless a host is required (`host_repo` set as a name, or a required `GIT_HOME/<name>` lookup). If the host is a git repo, fetch-deps clones it with `--no-hardlinks` into `src/` (never network). Linked worktrees and `--shared` (alternates) src trees are replaced. **Without GIT_HOME**, `git_https` / `source_kind = "seed-src"` / file pins still run. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
+Optional offline shortcut, never mandatory. If the host is a readable git repo, fetch-deps clones it with `--no-hardlinks` into `src/`. If it is missing or unreadable, fetch-deps uses `git_https` or `git_ssh` and prints the `chown` / `chmod` / `setfacl` / `ssh` command David can run. Linked worktrees and `--shared` (alternates) src trees are replaced. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
 
 ---
 
@@ -184,10 +184,10 @@ sha256 = "…"
 - Leave app-consumed binaries **only** under `src/` (they vanish without materialize).
 - Treat `~/git/...` as the pin if `src/` was never materialized.
 - `git add` a full non-submodule dump of library sources into the app repo.
-- Use SSH for `[[source]]` URLs (never; use HTTPS / file / seed). `git_ssh` on a git pin is metadata only.
+- Use SSH for `[[source]]` URLs (never; use HTTPS / file / seed). Git pins may set `git_ssh`; fetch-deps prefers `git_https`, then `git_ssh`.
 - Expect bit-identical SO files when `reproducible = false` (process still must be documented).
 - Skip a missing sandbox: pass both `--no-bwrap` and `--no-landlock`, or install the tools.
-- Network when a host repo exists (missing commit is an error).
+- Skip a remote URL when the host shortcut is missing or unreadable (host is optional).
 
 ---
 
