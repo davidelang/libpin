@@ -42,9 +42,13 @@ A leftover `@@GIT_HOME@@` (or any `@@…@@`) token in `git_home` / `host_repo` i
 
 ### Git transport policy
 
+Declared, **loud** fallback (printed at each step). Not a silent/hidden fallback (`|| true`, swallowed stderr, retry the next URL after a failed fetch).
+
 - A local host clone (`GIT_HOME` / `host_repo`) is an **optional offline shortcut**, never mandatory.
-- **Network:** `git_https` if set, else `git_ssh`. Agents typically succeed on HTTPS; SSH may need David’s keys.
-- If the host shortcut is missing or unreadable, fetch-deps uses the remote URL and prints the `chown` / `chmod` / `setfacl` / `ssh` command David can run.
+- If the shortcut is a readable git repo that has the pin sha, clone from it (no network). An **ambiguous** sha on that host is a hard fail (do not fetch a different commit).
+- Otherwise fetch-deps prints why the shortcut is unused and takes **one** remote: `git_https` if set, else `git_ssh`. A failed `git_https` fetch does not retry `git_ssh`.
+- Unreadable host: print the `chown` / `chmod` / `setfacl` command David can run, then use the remote when set. SSH key failure: print `ssh -T` / `git clone` / `chmod` on `~/.ssh` / `GIT_SSH_COMMAND`.
+- `source_kind = "seed-src"` is used only when declared and no remote URL is set. Empty `git_https` does not imply it.
 - File `[[source]]` URLs **never** use SSH (`https://`, `http://`, `file:relative`, `file:///abs` only). curl is the only HTTP client.
 
 ### `source_kind`
@@ -70,7 +74,7 @@ A leftover `@@GIT_HOME@@` (or any `@@…@@`) token in `git_home` / `host_repo` i
 | `host_repo` absent, `GIT_HOME` unset or path missing | no shortcut; use remote |
 | leftover `@@…@@` token | error |
 
-If the shortcut is a readable git repo that has the pin sha, clone from it (`--no-hardlinks`, no network). If it is missing, unreadable, or lacks the commit, use `git_https` or `git_ssh`. An unreadable host prints:
+An unreadable host prints:
 
 ```text
 David: chmod a+rX <host> && chmod -R a+rX <host>/.git

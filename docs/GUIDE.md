@@ -84,7 +84,7 @@ build = []
 
 ### Local full clone (`GIT_HOME`)
 
-Optional offline shortcut, never mandatory. If the host is a readable git repo, fetch-deps clones it with `--no-hardlinks` into `src/`. If it is missing or unreadable, fetch-deps uses `git_https` or `git_ssh` and prints the `chown` / `chmod` / `setfacl` / `ssh` command David can run. Linked worktrees and `--shared` (alternates) src trees are replaced. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
+Optional offline shortcut, never mandatory. Declared loud fallback: usable host, else `git_https`, else `git_ssh`. Each step is printed. A failed HTTPS fetch does not retry SSH. If the host is missing or unreadable, fetch-deps prints the `chown` / `chmod` / `setfacl` / `ssh` command David can run and uses the remote URL. Linked worktrees and `--shared` (alternates) src trees are replaced. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
 
 ---
 
