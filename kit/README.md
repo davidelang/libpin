@@ -6,11 +6,14 @@ Copy or rsync this directory to your project’s `third_party/` (or use it in pl
 
 | File | Role |
 |------|------|
-| `fetch-deps` | Materialize pins (git / `[[source]]`), RO/RW, build orchestration |
-| `get-artifacts` | Collect `[[artifact]]` rows from `libpin.toml` |
-| `libpin-sandbox` | bwrap outer + Landlock inner |
+| `fetch-deps` | Materialize pins (git / `[[source]]` / seed-src), RO/RW, build, check, outdated |
+| `get-artifacts` | Collect `[[artifact]]` rows from `libpin.toml` (required sha256) |
+| `libpin-sandbox` | bwrap outer + Landlock inner (write-probe nest detection) |
 | `libpin-bwrap` | bubblewrap helper |
 | `libpin-landlock` | Landlock mutation confinement (Python) |
+| `VERSION` | Companion stamp; must match the embedded `LIBPIN_VERSION` in every script |
+| `tests/run.sh` | Throwaway `--git-home` fixtures |
+| `hooks/pre-commit-git-home-leak` | Staged `libpin.toml` must not contain an expanded `GIT_HOME` |
 
 ## Bundled pins
 
@@ -28,6 +31,7 @@ cd "$(dirname "$0")"   # this kit directory
 cat example/artifact/hello.bin
 cat files-pin/src/hello.txt
 ./libpin-landlock --status
+./tests/run.sh
 ```
 
 ## Docs
@@ -42,4 +46,4 @@ See the parent repo:
 
 ## Requirements
 
-bash, python3 (`tomllib` or `tomli`), git (for git pins). Optional: `bubblewrap`, Landlock-capable kernel.
+bash, python3 ≥ 3.11 (`tomllib` only), git (for git pins), curl. Sandbox: `bubblewrap` and a Landlock-capable kernel, or pass `--no-bwrap --no-landlock`.
