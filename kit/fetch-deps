@@ -13,19 +13,22 @@
 #   fetch-deps outdated [name…]  # compare pins to upstream; record tip in status.local
 #
 # Pin file: third_party/<name>/libpin.toml
-# Transport: host clone (--no-hardlinks) when a host is set or GIT_HOME/<name> is a
-#   git repo (never network); else git_https; else source_kind=seed-src. git_ssh is
-#   metadata the tool never uses.
+# Transport: a local host clone is an optional offline shortcut, never mandatory.
+#   If the host is missing or unreadable, use git_https, else git_ssh, else
+#   source_kind=seed-src. Permission/SSH failures print the exact command David
+#   can run (chown/chmod/setfacl/ssh); the agent then uses the remote URL when present.
 # Pins with default = false are omitted from the default NAME set.
 #
 # git_home= is smudged by consumers (lowercase LHS). --git-home DIR overrides.
-# A leftover @@…@@ token is always an error. Unset GIT_HOME is fine unless a host
-# is required (host_repo set as a name, or a required host lookup).
+# A leftover @@…@@ token is always an error. Unset GIT_HOME skips the host
+# shortcut and uses the remote URL.
+# GIT_TERMINAL_PROMPT=0 so an agent never hangs on a credential prompt.
 #
 # Sandbox: bwrap + Landlock via libpin-sandbox. Missing tools is an error:
 #   pass --no-bwrap --no-landlock to run unsandboxed
 LIBPIN_VERSION=2026.10.24
 set -euo pipefail
+export GIT_TERMINAL_PROMPT=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
@@ -272,27 +275,6 @@ git_host() {
   git -c "safe.directory=$host" -C "$host" "$@"
 }
 
-git_repo_error() {
-  local p="$1" err
-  if [[ ! -e "$p" ]]; then echo "does not exist"; return 0; fi
-  if [[ ! -d "$p/.git" && ! -f "$p/.git" ]]; then echo "has no .git"; return 0; fi
-  if err="$(git -c "safe.directory=$p" -C "$p" rev-parse --git-dir 2>&1)"; then
-    echo "git accepts it"
-    return 0
-  fi
-  echo "git: $err"
-}
-
-is_git_repo_host() {
-  local p="${1:-}" err
-  [[ -n "$p" && ( -d "$p/.git" || -f "$p/.git" ) ]] || return 1
-  if err="$(git -c "safe.directory=$p" -C "$p" rev-parse --git-dir 2>&1)"; then
-    return 0
-  fi
-  echo "fetch-deps: git -C $p rev-parse --git-dir failed: $err" >&2
-  return 1
-}
-
 # host_repo key is "set" only when present in TOML. Prints the value; rc 1 = absent, 2 = error.
 host_repo_set() {
   local file out rc=0
@@ -303,7 +285,8 @@ host_repo_set() {
   return 2
 }
 
-# Resolve host: rc 0 = path printed, 1 = no host (https/seed-src OK), 2 = hard fail.
+# Resolve host shortcut: rc 0 = path printed, 1 = no usable host (use remote),
+# 2 = pin config error (smudge / empty / absolute-under-GIT_HOME).
 local_repo_for() {
   local name="$1" hrset=0 hr="" p gh_real hr_real
   if hr="$(host_repo_set "$name")"; then
@@ -330,24 +313,14 @@ local_repo_for() {
             ;;
         esac
       fi
-      if is_git_repo_host "$hr"; then
-        realpath "$hr"
-        return 0
-      fi
-      echo "fetch-deps: FAIL $name: host_repo '$hr' rejected: $(git_repo_error "$hr")" >&2
-      return 2
+      host_shortcut_from_path "$name" "$hr"
+      return $?
     fi
     if [[ -z "${GIT_HOME:-}" ]]; then
-      echo "fetch-deps: FAIL $name: GIT_HOME required for $name" >&2
-      return 2
+      return 1
     fi
-    p="$GIT_HOME/$hr"
-    if is_git_repo_host "$p"; then
-      realpath "$p"
-      return 0
-    fi
-    echo "fetch-deps: FAIL $name: GIT_HOME required for $name ($p rejected: $(git_repo_error "$p"))" >&2
-    return 2
+    host_shortcut_from_path "$name" "$GIT_HOME/$hr"
+    return $?
   fi
 
   if [[ -z "${GIT_HOME:-}" ]]; then
@@ -355,24 +328,119 @@ local_repo_for() {
   fi
   p="$GIT_HOME/$name"
   if [[ -e "$p" ]]; then
-    if is_git_repo_host "$p"; then
-      realpath "$p"
-      return 0
-    fi
-    echo "fetch-deps: FAIL $name: GIT_HOME/$name ($p) exists but is not a git repo: $(git_repo_error "$p")" >&2
-    return 2
+    host_shortcut_from_path "$name" "$p"
+    return $?
   fi
   return 1
 }
 
-require_host_readable() {
-  local host="$1" name="$2"
-  if [[ ! -r "$host" || ! -x "$host" ]]; then
-    echo "fetch-deps: FAIL $name: no read access to host $host (you are $(id -un))" >&2
-    echo "  David: chmod a+rX $host" >&2
-    echo "  or:    setfacl -m u:$(id -un):rx $host" >&2
+# rc 0 = usable git repo on stdout; 1 = skip shortcut (message already printed).
+host_shortcut_from_path() {
+  local name="$1" p="$2" err
+  if [[ ! -e "$p" ]]; then
+    echo "fetch-deps: host shortcut $p does not exist (offline shortcut skipped)" >&2
     return 1
   fi
+  if [[ ! -r "$p" || ! -x "$p" ]]; then
+    report_david_host_perm "$p" "$name"
+    return 1
+  fi
+  if [[ -d "$p/.git" && ( ! -r "$p/.git" || ! -x "$p/.git" ) ]]; then
+    report_david_host_perm "$p" "$name"
+    return 1
+  fi
+  if [[ -f "$p/.git" && ! -r "$p/.git" ]]; then
+    report_david_host_perm "$p" "$name"
+    return 1
+  fi
+  if [[ ! -d "$p/.git" && ! -f "$p/.git" ]]; then
+    echo "fetch-deps: host shortcut $p exists but is not a git repo (has no .git); skipping it" >&2
+    return 1
+  fi
+  if err="$(git -c "safe.directory=$p" -C "$p" rev-parse --git-dir 2>&1)"; then
+    realpath "$p"
+    return 0
+  fi
+  if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
+    echo "fetch-deps: git -C $p rev-parse --git-dir failed: $err" >&2
+    report_david_host_perm "$p" "$name"
+    return 1
+  fi
+  echo "fetch-deps: host shortcut $p exists but is not a git repo (git: $err); skipping it" >&2
+  return 1
+}
+
+report_david_host_perm() {
+  local host="$1" name="$2" who
+  who="$(id -un)"
+  echo "fetch-deps: host shortcut $host is not readable (you are $who)" >&2
+  echo "  Host is an optional offline shortcut. A git_https or git_ssh URL will be used when set." >&2
+  echo "  David: chmod a+rX $host && chmod -R a+rX $host/.git" >&2
+  echo "  or:    setfacl -R -m u:${who}:rx $host" >&2
+  echo "  or:    chown -R dlang:dlang $host && chmod -R a+rX $host" >&2
+  echo "  then:  ./third_party/fetch-deps --git-home \"${GIT_HOME:-<GIT_HOME>}\" ro $name" >&2
+}
+
+is_ssh_url() {
+  local u="${1:-}"
+  [[ "$u" == git@*:* || "$u" == ssh://* ]]
+}
+
+ssh_authority_from_url() {
+  local u="$1"
+  case "$u" in
+    git@*:*) printf '%s\n' "${u%%:*}" ;;
+    ssh://*)
+      u="${u#ssh://}"
+      printf '%s\n' "${u%%/*}"
+      ;;
+  esac
+}
+
+report_david_ssh() {
+  local url="$1" dest="$2" err="$3" who auth
+  who="$(id -un)"
+  auth="$(ssh_authority_from_url "$url")"
+  echo "fetch-deps: ssh to $url failed (you are $who)" >&2
+  [[ -n "$err" ]] && echo "  $err" >&2
+  echo "  This agent cannot use your SSH keys. David can run:" >&2
+  if [[ -n "$auth" ]]; then
+    echo "  David: ssh -T $auth" >&2
+  fi
+  if [[ -n "$dest" ]]; then
+    echo "  David: git clone $url $dest" >&2
+  else
+    echo "  David: git clone $url" >&2
+  fi
+  echo "  David: chmod 700 /home/dlang/.ssh && chmod 600 /home/dlang/.ssh/id_ed25519" >&2
+  echo "  or:    GIT_SSH_COMMAND='ssh -i /home/dlang/.ssh/id_ed25519' git clone $url ${dest:-}" >&2
+}
+
+# Agents must not hang on a passphrase / host-key prompt. David can override GIT_SSH_COMMAND.
+prepare_ssh_transport() {
+  export GIT_TERMINAL_PROMPT=0
+  if [[ -z "${GIT_SSH_COMMAND:-}" && -z "${GIT_SSH:-}" ]]; then
+    export GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=10"
+  fi
+}
+
+# Prefer git_https (agents); git_ssh if that is the only remote. rc 1 = none.
+pin_remote_url() {
+  local lock https ssh
+  lock="$(pin_path "$1")"
+  https="$(pin_get_opt "$lock" git_https)" || exit 1
+  ssh="$(pin_get_opt "$lock" git_ssh)" || exit 1
+  [[ "$https" == "null" ]] && https=""
+  [[ "$ssh" == "null" ]] && ssh=""
+  if [[ -n "$https" ]]; then
+    printf '%s\n' "$https"
+    return 0
+  fi
+  if [[ -n "$ssh" ]]; then
+    printf '%s\n' "$ssh"
+    return 0
+  fi
+  return 1
 }
 
 repo_has_commit() {
@@ -512,12 +580,12 @@ remove_bad_src() {
 }
 
 ensure_remotes() {
-  local src="$1" host="${2:-}" https="${3:-}" cur
-  if [[ -n "$https" ]]; then
+  local src="$1" host="${2:-}" origin="${3:-}" cur
+  if [[ -n "$origin" ]]; then
     if cur="$(git -C "$src" config --get remote.origin.url)"; then
-      [[ "$cur" == "$https" ]] || git -C "$src" remote set-url origin "$https" || die "git remote set-url origin $https in $src failed"
+      [[ "$cur" == "$origin" ]] || git -C "$src" remote set-url origin "$origin" || die "git remote set-url origin $origin in $src failed"
     else
-      git -C "$src" remote add origin "$https" || die "git remote add origin $https in $src failed"
+      git -C "$src" remote add origin "$origin" || die "git remote add origin $origin in $src failed"
     fi
   fi
   if [[ -n "$host" ]]; then
@@ -842,6 +910,42 @@ lookup_track_kind() {
   return 1
 }
 
+# stdout: "tag SHA" or "branch SHA"
+remote_ls_track() {
+  local url="$1" track="$2" name="$3" ls rc=0 nheads ntags tip kind
+  if is_ssh_url "$url"; then
+    prepare_ssh_transport
+  fi
+  rc=0
+  ls="$(git ls-remote "$url" "refs/heads/$track" "refs/tags/$track" "refs/tags/$track^{}" 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "fetch-deps: git ls-remote $url failed: $ls" >&2
+    if is_ssh_url "$url"; then
+      report_david_ssh "$url" "$(src_path "$name")" "$ls"
+    fi
+    return 1
+  fi
+  nheads="$(printf '%s\n' "$ls" | awk -v r="refs/heads/$track" '$2==r{c++} END{print c+0}')"
+  ntags="$(printf '%s\n' "$ls" | awk -v r="refs/tags/$track" '$2==r{c++} END{print c+0}')"
+  if [[ "$nheads" -gt 0 && "$ntags" -gt 0 ]]; then
+    echo "fetch-deps: track_branch $track is both a tag and a branch on $url" >&2
+    return 1
+  fi
+  if [[ "$ntags" -gt 0 ]]; then
+    kind=tag
+    tip="$(printf '%s\n' "$ls" | awk -v r="refs/tags/$track^{}" '$2==r{print $1; found=1} END{if(found) exit 0; exit 1}')" \
+      || tip="$(printf '%s\n' "$ls" | awk -v r="refs/tags/$track" '$2==r{print $1; found=1} END{if(found) exit 0; exit 1}')"
+  elif [[ "$nheads" -gt 0 ]]; then
+    kind=branch
+    tip="$(printf '%s\n' "$ls" | awk -v r="refs/heads/$track" '$2==r{print $1; found=1} END{if(found) exit 0; exit 1}')"
+  else
+    echo "fetch-deps: track_branch $track not on $url" >&2
+    return 1
+  fi
+  [[ -n "$tip" ]] || { echo "fetch-deps: ls-remote $url had $track but no sha" >&2; return 1; }
+  printf '%s %s\n' "$kind" "$tip"
+}
+
 write_pin_sha() {
   local pin="$1" sha="$2" describe="$3" src="${4:-}"
   if [[ -n "$src" ]]; then
@@ -892,25 +996,51 @@ describe_at() {
   printf '%s\n' "$sha"
 }
 
+# rc 0 = done; 1 = hard fail; 3 = host unusable, caller should use remote.
 materialize_from_host() {
-  local name="$1" sha="$2" host="$3" src="$4" https="$5" full
-  require_host_readable "$host" "$name" || return 1
-  full="$(resolve_commit "$host" "$sha" host)" || return 1
+  local name="$1" sha="$2" host="$3" src="$4" origin="$5" full err rc=0
+  if [[ ! -r "$host" || ! -x "$host" ]]; then
+    report_david_host_perm "$host" "$name"
+    return 3
+  fi
+  rc=0
+  full="$(git_host "$host" rev-parse --verify "${sha}^{commit}" 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "fetch-deps: cannot resolve '$sha' in host $host: $full" >&2
+    if [[ "$full" == *"ambiguous"* ]]; then
+      echo "fetch-deps: sha '$sha' is ambiguous in $host" >&2
+      return 1
+    fi
+    if [[ "$full" == *"Permission denied"* || "$full" == *"dubious ownership"* ]]; then
+      report_david_host_perm "$host" "$name"
+      return 3
+    fi
+    echo "fetch-deps: host $host does not have $sha; using remote if present" >&2
+    return 3
+  fi
   if [[ -d "$src" ]] && is_standalone_clone "$src"; then
-    local has=0 rc=0
-    repo_has_commit "$src" "$full" src && has=1 || rc=$?
-    [[ "$rc" -eq 2 ]] && return 1
+    local has=0 hrc=0
+    repo_has_commit "$src" "$full" src && has=1 || hrc=$?
+    [[ "$hrc" -eq 2 ]] && return 1
     if [[ "$has" -eq 1 ]]; then
       echo "    reuse standalone src @ $full"
       checkout_pin_clean "$src" "$full"
-      ensure_remotes "$src" "$host" "$https"
+      ensure_remotes "$src" "$host" "$origin"
       check_no_submodules_lfs "$src" "$name" || return 1
       return 0
     fi
     echo "    fetch $full from host into existing src"
-    git -c "safe.directory=$host" -C "$src" fetch "$host" "$full"
+    if ! err="$(git -c "safe.directory=$host" -C "$src" fetch "$host" "$full" 2>&1)"; then
+      echo "$err" >&2
+      if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
+        report_david_host_perm "$host" "$name"
+        return 3
+      fi
+      echo "fetch-deps: FAIL $name: fetch $full from host $host failed" >&2
+      return 1
+    fi
     checkout_pin_clean "$src" "$full"
-    ensure_remotes "$src" "$host" "$https"
+    ensure_remotes "$src" "$host" "$origin"
     check_no_submodules_lfs "$src" "$name" || return 1
     return 0
   fi
@@ -918,15 +1048,39 @@ materialize_from_host() {
     remove_bad_src "$name" "$src" "$host"
   fi
   echo "    clone --no-hardlinks --no-checkout $host → $src"
-  git -c "safe.directory=$host" clone --no-hardlinks --no-checkout "$host" "$src"
+  if ! err="$(git -c "safe.directory=$host" clone --no-hardlinks --no-checkout "$host" "$src" 2>&1)"; then
+    echo "$err" >&2
+    if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
+      report_david_host_perm "$host" "$name"
+      return 3
+    fi
+    echo "fetch-deps: FAIL $name: clone from host $host failed" >&2
+    return 1
+  fi
   git -C "$src" checkout --detach "$full"
-  ensure_remotes "$src" "$host" "$https"
+  ensure_remotes "$src" "$host" "$origin"
   check_no_submodules_lfs "$src" "$name" || return 1
   echo "    checkout --detach $full (host $host)"
   return 0
 }
 
-materialize_from_https() {
+remote_fetch() {
+  local src="$1" url="$2" sha="$3" name="$4" err
+  if is_ssh_url "$url"; then
+    prepare_ssh_transport
+  fi
+  if ! err="$(git -C "$src" fetch origin "$sha" 2>&1)"; then
+    echo "$err" >&2
+    if is_ssh_url "$url" || [[ "$err" == *"Permission denied"* && "$err" == *"publickey"* ]]; then
+      report_david_ssh "$url" "$src" "$err"
+    fi
+    echo "fetch-deps: FAIL $name: git fetch $url $sha failed" >&2
+    return 1
+  fi
+  return 0
+}
+
+materialize_from_remote() {
   local name="$1" sha="$2" url="$3" src="$4" full
   if [[ -d "$src" ]] && is_standalone_clone "$src"; then
     local has=0 rc=0
@@ -940,9 +1094,9 @@ materialize_from_https() {
       check_no_submodules_lfs "$src" "$name" || return 1
       return 0
     fi
-    echo "    fetch $sha from origin"
+    echo "    fetch $sha from origin $url"
     ensure_remotes "$src" "" "$url"
-    git -C "$src" fetch origin "$sha"
+    remote_fetch "$src" "$url" "$sha" "$name" || return 1
     full="$(resolve_commit "$src" "$sha" src)" || return 1
     checkout_pin_clean "$src" "$full"
     check_no_submodules_lfs "$src" "$name" || return 1
@@ -955,7 +1109,7 @@ materialize_from_https() {
   echo "    git init + fetch $sha from $url"
   git -C "$src" init
   git -C "$src" remote add origin "$url"
-  git -C "$src" fetch origin "$sha"
+  remote_fetch "$src" "$url" "$sha" "$name" || return 1
   full="$(resolve_commit "$src" "$sha" src)" || return 1
   git -C "$src" checkout --detach "$full"
   check_no_submodules_lfs "$src" "$name" || return 1
@@ -977,7 +1131,7 @@ materialize_seed_src() {
 }
 
 resolve_pin_sha_for() {
-  local name="$1" lock sha track host rc=0 kind
+  local name="$1" lock sha track host rc=0 kind url info
   lock="$(pin_path "$name")"
   sha="$(pin_get_opt "$lock" git_sha)" || exit 1
   if is_real_sha "$sha"; then
@@ -1003,36 +1157,55 @@ resolve_pin_sha_for() {
     RESOLVED_DESCRIBE="$(describe_at "$host" "$RESOLVED_SHA" host)"
     return 0
   fi
-  echo "fetch-deps: FAIL $name: no git_sha and no host to resolve track_branch $track" >&2
-  return 1
+  url="$(pin_remote_url "$name")" || {
+    echo "fetch-deps: FAIL $name: no git_sha and no host or remote to resolve track_branch $track" >&2
+    return 1
+  }
+  info="$(remote_ls_track "$url" "$track" "$name")" || return 1
+  kind="${info%% *}"
+  RESOLVED_SHA="${info#* }"
+  RESOLVED_DESCRIBE="$RESOLVED_SHA"
+  echo "    track_branch $track ($kind) @ $RESOLVED_SHA from $url"
+  return 0
 }
 
-materialize_git() {
-  local name="$1" sha="$2" src lock https kind host rc=0
-  src="$(src_path "$name")"
-  lock="$(pin_path "$name")"
-  https="$(pin_get_opt "$lock" git_https)" || exit 1
-  [[ "$https" == "null" ]] && https=""
-  kind="$(pin_get_opt "$lock" source_kind)" || exit 1
-
-  host="$(local_repo_for "$name")" || rc=$?
-  [[ "$rc" -eq 2 ]] && return 1
-  if [[ "$rc" -eq 0 ]]; then
-    echo "    host $host (never network)"
-    materialize_from_host "$name" "$sha" "$host" "$src" "$https"
+materialize_from_url_or_seed() {
+  local name="$1" sha="$2" src="$3" kind url
+  url="$(pin_remote_url "$name")" && {
+    echo "    remote $url"
+    materialize_from_remote "$name" "$sha" "$url" "$src"
     return $?
-  fi
-  if [[ -n "$https" ]]; then
-    echo "    git_https $https"
-    materialize_from_https "$name" "$sha" "$https" "$src"
-    return $?
-  fi
+  }
+  kind="$(pin_get_opt "$(pin_path "$name")" source_kind)" || exit 1
   if [[ "$kind" == "seed-src" ]]; then
     materialize_seed_src "$name" "$src"
     return $?
   fi
-  echo "fetch-deps: FAIL $name: no host, no git_https, and source_kind is not seed-src (git_ssh is metadata only)" >&2
+  echo "fetch-deps: FAIL $name: no usable host shortcut and no git_https/git_ssh (source_kind is not seed-src)" >&2
   return 1
+}
+
+materialize_git() {
+  local name="$1" sha="$2" src lock origin host rc=0 hrc=0
+  src="$(src_path "$name")"
+  lock="$(pin_path "$name")"
+  origin="$(pin_remote_url "$name")" || origin=""
+
+  host="$(local_repo_for "$name")" || rc=$?
+  [[ "$rc" -eq 2 ]] && return 1
+  if [[ "$rc" -eq 0 ]]; then
+    echo "    host $host (offline shortcut)"
+    hrc=0
+    materialize_from_host "$name" "$sha" "$host" "$src" "$origin" || hrc=$?
+    if [[ "$hrc" -eq 0 ]]; then
+      return 0
+    fi
+    if [[ "$hrc" -ne 3 ]]; then
+      return 1
+    fi
+    echo "    host shortcut unusable; trying remote" >&2
+  fi
+  materialize_from_url_or_seed "$name" "$sha" "$src"
 }
 
 cmd_ro() {
@@ -1216,7 +1389,7 @@ cmd_status() {
 }
 
 cmd_refresh() {
-  local name="$1" host sha desc track kind pin_sha rc=0 src src_arg=""
+  local name="$1" host sha desc track kind pin_sha rc=0 src src_arg="" url info
   if should_reenter; then
     echo "    [sandbox=lib $name]"
     reenter_self lib "$name" refresh
@@ -1231,22 +1404,43 @@ cmd_refresh() {
   [[ -n "$track" ]] || { echo "    FAIL: refresh needs track_branch" >&2; return 1; }
   host="$(local_repo_for "$name")" || rc=$?
   [[ "$rc" -eq 2 ]] && return 1
-  [[ "$rc" -eq 0 ]] || { echo "    FAIL: refresh needs a host for $name" >&2; return 1; }
-  kind="$(lookup_track_kind "$host" "$track")" || return 1
-  resolve_pin_sha_for "$name" || return 1
-  pin_sha="$(resolve_commit "$host" "$RESOLVED_SHA" host)" || return 1
-  if [[ "$kind" == tag ]]; then
-    sha="$(resolve_commit "$host" "refs/tags/$track" host)" || return 1
-    if [[ "$sha" != "$pin_sha" ]]; then
-      echo "    FAIL: tag moved: track_branch $track now $sha, pin is $pin_sha (use upgrade --ref)" >&2
-      return 1
+  if [[ "$rc" -eq 0 ]]; then
+    kind="$(lookup_track_kind "$host" "$track")" || return 1
+    resolve_pin_sha_for "$name" || return 1
+    pin_sha="$(resolve_commit "$host" "$RESOLVED_SHA" host)" || return 1
+    if [[ "$kind" == tag ]]; then
+      sha="$(resolve_commit "$host" "refs/tags/$track" host)" || return 1
+      if [[ "$sha" != "$pin_sha" ]]; then
+        echo "    FAIL: tag moved: track_branch $track now $sha, pin is $pin_sha (use upgrade --ref)" >&2
+        return 1
+      fi
+      echo "    tag $track still at pin $pin_sha"
+      cmd_ro "$name"
+      return $?
     fi
-    echo "    tag $track still at pin $pin_sha"
-    cmd_ro "$name"
-    return $?
+    sha="$(resolve_commit "$host" "refs/heads/$track" host)" || return 1
+    desc="$(describe_at "$host" "$sha" host)"
+  else
+    url="$(pin_remote_url "$name")" || {
+      echo "    FAIL: refresh needs a host shortcut or git_https/git_ssh for $name" >&2
+      return 1
+    }
+    info="$(remote_ls_track "$url" "$track" "$name")" || return 1
+    kind="${info%% *}"
+    sha="${info#* }"
+    resolve_pin_sha_for "$name" || return 1
+    pin_sha="$RESOLVED_SHA"
+    if [[ "$kind" == tag ]]; then
+      if [[ "$sha" != "$pin_sha" ]]; then
+        echo "    FAIL: tag moved: track_branch $track now $sha, pin is $pin_sha (use upgrade --ref)" >&2
+        return 1
+      fi
+      echo "    tag $track still at pin $pin_sha"
+      cmd_ro "$name"
+      return $?
+    fi
+    desc="$sha"
   fi
-  sha="$(resolve_commit "$host" "refs/heads/$track" host)" || return 1
-  desc="$(describe_at "$host" "$sha" host)"
   src="$(src_path "$name")"
   if [[ -d "$src/.git" || -f "$src/.git" ]]; then
     src_arg="$src"
@@ -1564,7 +1758,7 @@ cmd_check() {
 }
 
 cmd_outdated() {
-  local name="$1" lock src sp host rc=0 track kind tip pin_sha last https
+  local name="$1" lock src sp host rc=0 track kind tip pin_sha last url info
   if should_reenter; then
     echo "    [sandbox=lib $name]"
     reenter_self lib "$name" outdated
@@ -1581,7 +1775,6 @@ cmd_outdated() {
   resolve_pin_sha_for "$name" || return 1
   pin_sha="$RESOLVED_SHA"
   track="$(pin_get_opt "$lock" track_branch)" || exit 1
-  https="$(pin_get_opt "$lock" git_https)" || exit 1
   host=""
   rc=0
   host="$(local_repo_for "$name")" || rc=$?
@@ -1598,30 +1791,12 @@ cmd_outdated() {
     else
       tip="$(git_host "$host" rev-parse HEAD)"
     fi
-  elif [[ -n "$https" && -n "$track" ]]; then
-    local ls
-    ls="$(git ls-remote "$https" "refs/heads/$track" "refs/tags/$track" "refs/tags/$track^{}")" || {
-      echo "    FAIL: git ls-remote $https for $track" >&2
-      return 1
-    }
-    local nheads ntags
-    nheads="$(printf '%s\n' "$ls" | awk -v r="refs/heads/$track" '$2==r{c++} END{print c+0}')"
-    ntags="$(printf '%s\n' "$ls" | awk -v r="refs/tags/$track" '$2==r{c++} END{print c+0}')"
-    if [[ "$nheads" -gt 0 && "$ntags" -gt 0 ]]; then
-      echo "    FAIL: track_branch $track is both a tag and a branch on $https" >&2
-      return 1
-    fi
-    if [[ "$ntags" -gt 0 ]]; then
-      tip="$(printf '%s\n' "$ls" | awk -v r="refs/tags/$track^{}" '$2==r{print $1; f=1} END{if(!f) exit 1}')" \
-        || tip="$(printf '%s\n' "$ls" | awk -v r="refs/tags/$track" '$2==r{print $1; f=1} END{if(!f) exit 1}')"
-    elif [[ "$nheads" -gt 0 ]]; then
-      tip="$(printf '%s\n' "$ls" | awk -v r="refs/heads/$track" '$2==r{print $1; f=1} END{if(!f) exit 1}')"
-    else
-      echo "    FAIL: track_branch $track not on $https" >&2
-      return 1
-    fi
+  elif [[ -n "$track" ]] && url="$(pin_remote_url "$name")"; then
+    info="$(remote_ls_track "$url" "$track" "$name")" || return 1
+    kind="${info%% *}"
+    tip="${info#* }"
   else
-    echo "    FAIL: cannot determine upstream (need host, or git_https+track_branch)" >&2
+    echo "    FAIL: cannot determine upstream (need host shortcut, or git_https/git_ssh + track_branch)" >&2
     return 1
   fi
   last=""

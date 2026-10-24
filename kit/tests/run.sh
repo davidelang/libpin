@@ -153,22 +153,107 @@ PATH="$T/bin:$PATH" fd ro toy; rc=$?
 unset GIT_WRAP_LOG
 PATH="${PATH#$T/bin:}"
 
-# non-git GIT_HOME/<name>
+# non-git GIT_HOME/<name> is a skipped shortcut; no remote → fail
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
 mkdir -p "$T/gh-notgit/toy"
 echo notgit >"$T/gh-notgit/toy/file"
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
 (cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock --git-home "$T/gh-notgit" ro toy) >"$T/out" 2>&1; rc=$?
-[[ $rc -ne 0 ]] && grep -q 'not a git repo' "$T/out" && ok "non-git GIT_HOME/<name> fails" || bad "notgit rc=$rc $(tailout)"
+[[ $rc -ne 0 ]] && grep -q 'not a git repo' "$T/out" && grep -q 'no usable host shortcut' "$T/out" && ok "non-git GIT_HOME/<name> without remote fails" || bad "notgit rc=$rc $(tailout)"
+
+# non-git shortcut + git_https uses the remote
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+(cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock --git-home "$T/gh-notgit" ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'skipping it' "$T/out" && [[ -f "$R/third_party/toy/src/content" ]] && ok "non-git shortcut falls through to git_https" || bad "notgit+https rc=$rc $(tailout)"
 
 # smudge token
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
 (cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock --git-home '@@GIT_HOME@@' ro toy) >"$T/out" 2>&1; rc=$?
 [[ $rc -ne 0 ]] && grep -q 'leftover smudge token' "$T/out" && ok "smudge token is an error" || bad "smudge rc=$rc $(tailout)"
 
-# GIT_HOME unset + host_repo name fails
+# GIT_HOME unset + host_repo name uses git_https (host is never mandatory)
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
-sed -i 's/^name = "toy"/name = "toy"\nhost_repo = "toy"/' "$R/third_party/toy/libpin.toml"
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"toy\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
 (cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
-[[ $rc -ne 0 ]] && grep -q 'GIT_HOME required for toy' "$T/out" && ok "GIT_HOME unset + host_repo name fails" || bad "host required rc=$rc $(tailout)"
+[[ $rc -eq 0 ]] && [[ -f "$R/third_party/toy/src/content" ]] && ok "GIT_HOME unset + host_repo name uses git_https" || bad "host optional rc=$rc $(tailout)"
+
+# GIT_HOME unset + host_repo name + no remote fails
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"toy\"|" "$R/third_party/toy/libpin.toml"
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+(cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'no usable host shortcut' "$T/out" && ok "host_repo name without GIT_HOME or remote fails" || bad "host+noremote rc=$rc $(tailout)"
+
+# unreadable host: report chmod/setfacl, use git_https
+BLOCK="$T/blocked/toy"
+mkdir -p "$T/blocked"
+cp -a "$GH/toy" "$BLOCK"
+chmod a-rx "$BLOCK"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$BLOCK\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+fd ro toy; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'chmod a+rX' "$T/out" && grep -q 'setfacl' "$T/out" && grep -q 'chown -R dlang:dlang' "$T/out" && [[ -f "$R/third_party/toy/src/content" ]] && ok "unreadable host reports David chmod and uses git_https" || bad "blocked host rc=$rc $(tailout)"
+chmod u+rwx "$BLOCK"
+chmod -R u+rwx "$T/blocked"
+
+# unreadable host, no remote: fail with the same David commands
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$BLOCK\"|" "$R/third_party/toy/libpin.toml"
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+chmod a-rx "$BLOCK"
+fd ro toy; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'chmod a+rX' "$T/out" && grep -q 'chown -R dlang:dlang' "$T/out" && grep -q 'no usable host shortcut' "$T/out" && ok "unreadable host without remote fails with chmod help" || bad "blocked noremote rc=$rc $(tailout)"
+chmod u+rwx "$BLOCK"
+chmod -R u+rwx "$T/blocked"
+
+# git_ssh is a real transport when git_https is absent
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+sed -i "s|^name = \"toy\"|name = \"toy\"\ngit_ssh = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+(cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && [[ -f "$R/third_party/toy/src/content" ]] && grep -q "remote $GH/toy" "$T/out" && ok "git_ssh used when no host and no git_https" || bad "git_ssh rc=$rc $(tailout)"
+
+# git_https is preferred over git_ssh (agents)
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|^name = \"toy\"|name = \"toy\"\ngit_ssh = \"git@should-not-be-used.example:toy.git\"|" "$R/third_party/toy/libpin.toml"
+(cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "remote $GH/toy" "$T/out" && ! grep -q 'should-not-be-used' "$T/out" && ok "git_https preferred over git_ssh" || bad "https-pref rc=$rc $(tailout)"
+
+# readable host without the pin sha falls through to git_https
+EMPTYH="$T/emptyhost"
+rm -rf "$EMPTYH"
+mkdir -p "$EMPTYH"
+G -C "$EMPTYH" init -q -b master
+echo other >"$EMPTYH/content"; G -C "$EMPTYH" add -A; G -C "$EMPTYH" commit -qm other
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$EMPTYH\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+fd ro toy; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'does not have' "$T/out" && grep -q 'trying remote' "$T/out" && grep -q "remote $GH/toy" "$T/out" && grep -q v1 "$R/third_party/toy/src/content" && ok "host missing sha falls through to git_https" || bad "host-miss-sha rc=$rc $(tailout)"
+
+# ssh URL permission/key failure prints a command David can run
+mkdir -p "$T/sshbin"
+cat >"$T/sshbin/ssh" <<'EOF'
+#!/bin/bash
+echo "git@invalid.example: Permission denied (publickey)." >&2
+exit 255
+EOF
+chmod +x "$T/sshbin/ssh"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+sed -i 's|^name = "toy"|name = "toy"\ngit_ssh = "git@invalid.example:toy.git"|' "$R/third_party/toy/libpin.toml"
+(cd "$R" && env PATH="$T/sshbin:$PATH" GIT_SSH="$T/sshbin/ssh" GIT_SSH_COMMAND="$T/sshbin/ssh" ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'David: ssh -T git@invalid.example' "$T/out" && grep -q 'David: git clone git@invalid.example:toy.git' "$T/out" && grep -q 'chmod 700 /home/dlang/.ssh' "$T/out" && ok "ssh failure prints David ssh/clone commands" || bad "ssh help rc=$rc $(tailout)"
+
+# refresh without GIT_HOME uses git_https
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+(cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock refresh toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "pin → $V2" "$T/out" && ok "refresh without host uses git_https" || bad "refresh remote rc=$rc $(tailout)"
 
 # host_repo name under GIT_HOME works; absolute inside GIT_HOME rejected
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
@@ -559,8 +644,8 @@ cp -a "$KIT/." "$EX/"
 
 # Host owned by another user: cannot chown without root.
 # Manual: sudo chown ai-code:ai-code /path/to/host && ./fetch-deps --git-home ... ro <pin>
-# Expected: git's "detected dubious ownership" is shown (safe.directory=<host> is passed;
-# if objects are still unreadable, the chmod/setfacl lines for David are printed).
+# Expected: permission/ownership is reported with David chmod/chown/setfacl lines;
+# if git_https or git_ssh is set, materialize continues from that URL.
 
 echo "passed $pass failed $fail"
 [[ $fail -eq 0 ]]
