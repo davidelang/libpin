@@ -233,7 +233,7 @@ mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
 sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$EMPTYH\"|" "$R/third_party/toy/libpin.toml"
 sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
 fd ro toy; rc=$?
-[[ $rc -eq 0 ]] && grep -q 'does not have' "$T/out" && grep -q 'trying remote' "$T/out" && grep -q "remote $GH/toy" "$T/out" && grep -q v1 "$R/third_party/toy/src/content" && ok "host missing sha falls through to git_https" || bad "host-miss-sha rc=$rc $(tailout)"
+[[ $rc -eq 0 ]] && grep -q 'does not have' "$T/out" && grep -q 'declared fallback to remote' "$T/out" && grep -q "remote $GH/toy" "$T/out" && grep -q v1 "$R/third_party/toy/src/content" && ok "host missing sha falls through to git_https" || bad "host-miss-sha rc=$rc $(tailout)"
 
 # ssh URL permission/key failure prints a command David can run
 mkdir -p "$T/sshbin"

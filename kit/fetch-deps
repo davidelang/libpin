@@ -13,10 +13,13 @@
 #   fetch-deps outdated [name…]  # compare pins to upstream; record tip in status.local
 #
 # Pin file: third_party/<name>/libpin.toml
-# Transport: a local host clone is an optional offline shortcut, never mandatory.
-#   If the host is missing or unreadable, use git_https, else git_ssh, else
-#   source_kind=seed-src. Permission/SSH failures print the exact command David
-#   can run (chown/chmod/setfacl/ssh); the agent then uses the remote URL when present.
+# Transport: declared loud fallback (printed), never a silent swallow.
+#   usable host shortcut, else git_https if set, else git_ssh if set, else
+#   source_kind=seed-src. A failed git_https fetch does not retry git_ssh.
+#   Host is never mandatory when a remote URL is set. Permission/SSH failures
+#   print the exact command David can run (chown/chmod/setfacl/ssh); the agent
+#   then uses the remote URL when present. Ambiguous sha on a readable host
+#   is a hard fail (do not network for a different commit).
 # Pins with default = false are omitted from the default NAME set.
 #
 # git_home= is smudged by consumers (lowercase LHS). --git-home DIR overrides.
@@ -1185,6 +1188,7 @@ materialize_from_url_or_seed() {
   return 1
 }
 
+# Declared fallback, printed: host shortcut, else git_https, else git_ssh, else seed-src.
 materialize_git() {
   local name="$1" sha="$2" src lock origin host rc=0 hrc=0
   src="$(src_path "$name")"
@@ -1203,7 +1207,7 @@ materialize_git() {
     if [[ "$hrc" -ne 3 ]]; then
       return 1
     fi
-    echo "    host shortcut unusable; trying remote" >&2
+    echo "    host shortcut unusable; declared fallback to remote" >&2
   fi
   materialize_from_url_or_seed "$name" "$sha" "$src"
 }
