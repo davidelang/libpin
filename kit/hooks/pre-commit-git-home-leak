@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# pre-commit helper: staged libpin.toml must not contain an expanded GIT_HOME path
+# (that means the clean filter did not run).
+set -euo pipefail
+GIT_HOME_VAL="${GIT_HOME:-}"
+if [[ -z "$GIT_HOME_VAL" ]]; then
+  echo "pre-commit-git-home-leak: GIT_HOME unset; nothing to scan" >&2
+  exit 0
+fi
+if [[ "$GIT_HOME_VAL" == *"@@"* ]]; then
+  echo "pre-commit-git-home-leak: leftover smudge token in GIT_HOME ($GIT_HOME_VAL)" >&2
+  exit 1
+fi
+fail=0
+while IFS= read -r f; do
+  [[ -n "$f" ]] || continue
+  if grep -F -- "$GIT_HOME_VAL" "$f" >/dev/null; then
+    echo "pre-commit-git-home-leak: $f contains expanded git_home $GIT_HOME_VAL (clean filter did not run)" >&2
+    fail=1
+  fi
+done < <(git diff --cached --name-only -- '**/libpin.toml' 'libpin.toml')
+exit "$fail"
