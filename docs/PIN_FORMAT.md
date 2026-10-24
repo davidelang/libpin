@@ -2,7 +2,9 @@
 
 `libpin.toml` is the **pin contract**: identity, how to build, and how to collect artifacts. It is **not** machine-specific (no “this laptop’s paths”). Checkout mode (RO/RW) lives in gitignored `status.local`.
 
-Format: **TOML** (no significant indentation). Filename ties to the tooling name *libpin*.
+Format: **TOML** (no significant indentation). Filename ties to the tooling name *libpin*. Parser: Python ≥ 3.11 `tomllib` only.
+
+Companion kit stamp: `kit/VERSION` must match the `LIBPIN_VERSION` embedded in every kit script. The five scripts plus `VERSION` are published as one set.
 
 ---
 
@@ -11,18 +13,23 @@ Format: **TOML** (no significant indentation). Filename ties to the tooling name
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
 | `name` | string | yes | Library id; directory name under `third_party/` |
-| `git_https` | string | for git pins | HTTPS clone URL |
-| `git_ssh` | string | optional | `git@…` only with `--allow-ssh` / maintainer machines |
-| `git_sha` | string | for git pins | Locked commit (full SHA preferred) |
-| `git_describe` | string | optional | Human label (tag / describe) |
-| `track_branch` | string | optional | Branch the pin usually tracks |
-| `source_kind` | string | optional | `"files"` for pure non-git pins; omit for git |
+| `git_https` | string | for network git pins | HTTPS clone URL (the only network transport) |
+| `git_ssh` | string | optional | Recorded metadata; the tool never uses it |
+| `git_sha` | string | for git pins | Locked commit (full SHA preferred; partial SHAs accepted if unique) |
+| `git_describe` | string | optional | Human label (tag / describe); updated with `git_sha` on refresh/upgrade |
+| `track_branch` | string | optional | Branch **or** tag the pin tracks (see below) |
+| `host_repo` | string | optional | Host lookup: a name under `GIT_HOME`, or an absolute path **outside** `GIT_HOME` |
+| `source_kind` | string | when not a git pin | `"files"` for `[[source]]` pins; `"seed-src"` for `./seed-src` materialize |
+| `default` | bool | optional | `false` omits the pin from the default NAME set of fetch-deps and get-artifacts |
+| `depends` | array of strings | optional | Other pin names whose `git_sha` must match at this pin’s tree |
 | `reproducible` | bool / string | recommended | `true` \| `false` \| `"unknown"` — bit-identical artifacts expected? |
 | `build_time` | string | recommended | t-shirt size (see below) |
 | `requires_writable_src` | bool | optional | Default `false`. If `true`, leave `src` writable after materialize |
 | `build` | array of strings | optional | Commands run from the pin dir; `[]` = materialize-only |
 | `consumer_note` | string | optional | One-line note for humans / agents |
-| `patches` | array of strings | optional | Explicit patch order; else `patches/*.patch` sorted by name |
+| `patches` | array of strings | optional | Explicit patch order; else one sorted list of `*.patch` and `*.diff` |
+
+A leftover `@@GIT_HOME@@` (or any `@@…@@`) token in `git_home` / `host_repo` is always an error.
 
 ### `build_time` values
 
@@ -35,8 +42,57 @@ Format: **TOML** (no significant indentation). Filename ties to the tooling name
 
 ### Git transport policy
 
-- **Default:** HTTPS only (`git_https`).
-- **SSH (`git@`):** only when the operator passes `--allow-ssh` (or equivalent maintainer policy). File `[[source]]` URLs **never** use SSH.
+- **Network:** `git_https` only. `git_ssh` is recorded so humans still see the SSH URL; fetch-deps never clones or fetches over SSH.
+- A pin with only `git_ssh` (no host, no `git_https`, not `source_kind = "seed-src"`) fails.
+- File `[[source]]` URLs **never** use SSH (`https://`, `http://`, `file:relative`, `file:///abs` only). curl is the only HTTP client.
+
+### `source_kind`
+
+| Value | Materialize |
+|-------|-------------|
+| omitted / git | git at `git_sha` (host clone, else `git_https`) |
+| `"files"` | `[[source]]` rows only (seed or url + sha256) |
+| `"seed-src"` | run `./seed-src` in the pin dir; empty `git_https` does **not** imply this |
+
+### `host_repo` and `GIT_HOME`
+
+`host_repo` is **set** only when the key is present in the TOML. The pin name is the `GIT_HOME` lookup key when `host_repo` is omitted, not an implicit `host_repo` value.
+
+| Situation | Result |
+|-----------|--------|
+| `host_repo` present, name (not absolute) | `GIT_HOME` required; host is `$GIT_HOME/<name>` |
+| `host_repo` present, absolute path under `GIT_HOME` | error (use the name) |
+| `host_repo` present, absolute path outside `GIT_HOME` | must be a git repo |
+| `host_repo` absent, `GIT_HOME` set, `$GIT_HOME/<pin>` is a git repo | that host |
+| `host_repo` absent, `GIT_HOME` set, path exists but is not git | error |
+| `host_repo` absent, `GIT_HOME` set, path missing | no host (https / seed-src may run) |
+| `host_repo` absent, `GIT_HOME` unset | no host (https / files / seed-src may run) |
+| leftover `@@…@@` token | error |
+
+If `host_repo` is set **or** the resolved host is a git repo: **never network**. Missing commit is an error, not a fall-through to `git_https`.
+
+Materialize from a host is `git clone --no-hardlinks --no-checkout` then `checkout --detach <sha>`. Linked worktrees and clones with alternates (`--shared`) are replaced. `origin` is `git_https` when present; remote `host` is the resolved path.
+
+`--git-home DIR` overrides the smudged `git_home=` value. Consumers smudge lowercase `git_home=`; the kit does not hard-code a machine path.
+
+### `track_branch`
+
+Looked up as `refs/tags/<name>` and `refs/heads/<name>` on the host. Both exist → error.
+
+| Kind | `refresh` | `upgrade --ref` |
+|------|-----------|-----------------|
+| branch | advances the pin to the branch tip | allowed |
+| tag | verifies the tag still resolves to the pinned sha (fail “tag moved”) | required to change the pin |
+
+Pins without `git_sha` may follow `track_branch`. Partial shas are accepted; resolve to a unique full commit or fail.
+
+### `depends`
+
+`depends = ["<pin>"]`. At this pin’s sha, read `third_party/<dep>/libpin.toml` from materialized `src` if present, else `git show <pin-sha>:…` on the host. If neither exists: fail “need host or src”. Fail if that file’s `git_sha` (resolved to full) differs from this tree’s pin for that dep, naming both.
+
+### `default = false`
+
+Omits the pin from fetch-deps and get-artifacts when no NAME arguments are given. Explicit `fetch-deps ro rclone` still runs. Use this for heavy pins that should not join the default set (rclone, paddle, the kit `example`).
 
 ---
 
@@ -44,11 +100,12 @@ Format: **TOML** (no significant indentation). Filename ties to the tooling name
 
 ```toml
 name = "opencv"
-git_ssh = "git@github.com:opencv/opencv.git"
+git_ssh = "git@github.com:opencv/opencv.git"   # metadata only
 git_https = "https://github.com/opencv/opencv.git"
 git_sha = "71d3237a093b60a27601c20e9ee6c3e52154e8b1"
 git_describe = "4.10.0"
-track_branch = "4.10.0"
+track_branch = "4.10.0"   # tag: refresh verifies; upgrade --ref to move
+host_repo = "opencv"      # optional; omit to look up GIT_HOME/opencv
 
 reproducible = false
 build_time = "tens_of_minutes"
@@ -59,11 +116,12 @@ consumer_note = "Android ABIs; 16k pages; slim modules"
 [[artifact]]
 path = "artifact/jni/arm64-v8a/libopencv_java4.so"
 from = "src/bin/arm64-v8a/libopencv_java4.so"
-sha256 = "…"   # optional; fail row if mismatch
+sha256 = "…"
 
 [[artifact]]
 path = "app/src/main/jniLibs/arm64-v8a/libopencv_java4.so"
 from = "src/bin/arm64-v8a/libopencv_java4.so"
+sha256 = "…"
 ```
 
 ---
@@ -104,6 +162,8 @@ sha256 = "…"
 3. Still wrong → **hard fail**. fetch-deps will not spin waiting for a remote to “become” the old hash.
 4. When a remote moves, **update `sha256` (and seed)** in `libpin.toml`.
 
+File pins with a `patches` key or a `patches/` directory are an error (no `git apply` on a non-git src).
+
 ---
 
 ## Artifacts: `[[artifact]]`
@@ -112,10 +172,12 @@ Each section is independent (same `from` may appear twice with different `path`)
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `path` | yes | Destination (see resolution) |
+| `path` | yes | Destination (see resolution); must resolve inside the repo root |
 | `from` | yes | Source under the pin dir after build (may be a **glob**) |
-| `pick` | for globs | `newest` (mtime, **default**), `sort`, `sort-n` |
-| `sha256` | optional | Fail that row if resolved content mismatches |
+| `pick` | for multi-match globs | `newest` \| `sort` \| `sort-n`. **Omitted** → exactly one match required |
+| `sha256` | yes | Content hash. The only placeholder is 64 zeros, which `--record` replaces. Empty or `"TBD"` are errors. A missing key is an error except under `--record`, which inserts the line |
+
+Aliases `artifacts` / `from_src` are errors.
 
 ### `path` resolution
 
@@ -123,7 +185,7 @@ Each section is independent (same `from` may appear twice with different `path`)
 |--------|-------------|
 | `artifact/…` or other pin-relative | `third_party/<lib>/<path>` |
 | `app/…` | `<repo-root>/app/…` (e.g. Android jniLibs) |
-| absolute | as written |
+| absolute | only if `realpath` is under the repo root |
 
 ### Glob + `pick`
 
@@ -132,20 +194,24 @@ Each section is independent (same `from` may appear twice with different `path`)
 path = "artifact/hello.bin"
 from = "src/bin/hello-*.bin"
 pick = "newest"
+sha256 = "…"
 ```
 
-If `from` is not a glob, `pick` is ignored. Table name is singular **`[[artifact]]`**.
+Zero glob matches is a failure. If `from` is not a glob, omit `pick` (exactly one file). Table name is singular **`[[artifact]]`**. `pick = "newest"` is valid when written explicitly; it is not a default.
 
 ### Reproducible builds
 
-- `reproducible = true` — same pin + patches + scripts expected to yield **bit-for-bit** identical artifacts (rare). Artifact `sha256` is a strong audit check.
-- `false` / `unknown` — process is still reproducible; bytes may vary (timestamps, NDK, Docker base). Optional `sha256` still detects accidental change of the committed file.
+- `reproducible = true` — same pin + patches + scripts expected to yield **bit-for-bit** identical artifacts. `upgrade` builds twice (each after `git clean -xfd` plus removing `src/build` and `src/bin`) and the second must match the recorded sha256.
+- `false` / `unknown` — process is still reproducible; bytes may vary (timestamps, NDK, Docker base). Required `sha256` still detects accidental change of the committed file.
+
+`build --record` writes new sha256 values into `libpin.toml` (temp file + rename).
 
 ---
 
 ## Patches
 
-- Live under `patches/` (or paths listed in `patches = [...]`).
+- Honor `patches = [...]` order when present, else one sorted list of `*.patch` and `*.diff`.
+- Reject paths with `..` or a leading `/`.
 - Applied **only** by `fetch-deps` at materialize — **never** re-applied in `./build`.
 - Dirty `src` **only** from these patches is acceptable; other dirt means the tree is not a clean pin.
 
@@ -153,7 +219,7 @@ If `from` is not a glob, `pick` is ignored. Table name is singular **`[[artifact
 
 ## RO sources and `requires_writable_src`
 
-Default after `fetch-deps ro`: tree is read-only. Build scripts must create/chmod only the directories they need (e.g. `src/build`, `src/bin`). Prefer upstream’s normal out-of-source layout.
+Default after `fetch-deps ro`: tree is read-only (`chmod a-w` on files). Directories stay owner-writable. After a build, `src/build` and `src/bin` are re-opened so rebuilds can iterate. Build scripts may chmod only those scratch dirs.
 
 If a library **cannot** build from RO sources:
 
@@ -165,8 +231,26 @@ fetch-deps then leaves `src` writable after materialize (still a git tree at the
 
 ---
 
-## Optional local git accelerator (`GIT_HOME`)
+## Branch names (rw / upgrade)
 
-If `GIT_HOME/<lib>` (often `~/git/<lib>`) exists, fetch-deps may attach a **worktree** at `src/` so the full object store stays outside the app tree. Correctness does **not** require `GIT_HOME`; plain clone/fetch of the pin SHA still works (optional `--depth`).
+| Command | Default branch in `src` | Override |
+|---------|-------------------------|----------|
+| `rw` | `work` | `--branch NAME` |
+| `upgrade` | `upgrade/<ref>` | `--branch NAME` |
 
-Sandbox helpers, when confining writes, may allow only `$GIT_HOME/<lib>/.git` (or the resolved gitdir for a linked worktree) — not the entire `GIT_HOME`.
+Branches exist only in `src`. Agents never push to the host. On success, upgrade deletes the branch and detaches at the new pin. On failure, src and its branch are kept for debugging. Print for David: `git -C <src> push host HEAD:refs/heads/<branch>`.
+
+`status.local` has no `ve_branch` field.
+
+---
+
+## Submodules and Git LFS
+
+Materialize fails if the source has a `.gitmodules` file or contains Git LFS pointer files.
+
+---
+
+## `fetch-deps check` / `outdated`
+
+- **check:** `host_repo` validation; git_home leak warning (a committed `libpin.toml` containing the expanded `GIT_HOME` path means the clean filter did not run; `kit/hooks/pre-commit-git-home-leak` offers the same as a hook); `depends`; moved tags.
+- **outdated:** compare each pin with its upstream (host repo, or `track_branch` on `git_https`). Store the tip seen at the last check in `status.local`; report separately (a) upstream moved since the last check and (b) still behind with no new movement. Read-only apart from `status.local`.

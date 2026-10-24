@@ -1,6 +1,6 @@
 # libpin
 
-**Pin, materialize, build, and collect artifacts** for third-party libraries — with optional Linux write confinement (bubblewrap + Landlock).
+**Pin, materialize, build, and collect artifacts** for third-party libraries — with Linux write confinement (bubblewrap + Landlock). Missing sandbox tools is an error unless you pass `--no-bwrap --no-landlock`.
 
 libpin is a small toolkit you drop in as your project’s `third_party/` (or copy next to pins). It was battle-tested inside [VehicleExpenses](https://github.com/) against multi-hour Docker/NDK builds (OpenCV, rclone, Paddle-Lite, co-developed Kotlin libraries) and non-git file pins (model packs with mandatory `sha256`).
 
@@ -24,19 +24,19 @@ libpin standardizes:
 
 1. **One layout** for every dependency (git or file sources).
 2. **One pin file** (`libpin.toml`) — identity, build steps, artifact collection.
-3. **Optional sandboxing** so materialize/build may only **mutate** a declared surface (read/exec stay free so toolchains work).
-4. **Graceful degradation** — missing `bwrap` or Landlock → unsandboxed, still correct.
+3. **Write confinement** so materialize/build may only **mutate** a declared surface (read/exec stay free so toolchains work). Host clones under `GIT_HOME` are read-only.
+4. **Explicit unsandboxed mode** — missing `bwrap` or Landlock is an error; pass `--no-bwrap --no-landlock` to run without the sandbox.
 
 ## 30-second try
 
 ```bash
 cd kit   # this directory acts as third_party/
-./fetch-deps ro example
+./fetch-deps ro example files-pin
 ./fetch-deps build example
 cat example/artifact/hello.bin
-
-./fetch-deps ro files-pin
 cat files-pin/src/hello.txt
+
+./tests/run.sh
 ```
 
 Full walkthrough: **[docs/QUICKSTART.md](docs/QUICKSTART.md)**.
@@ -68,12 +68,12 @@ Tools assume they live **in** the directory that contains pins (classically name
 
 | Need | Notes |
 |------|--------|
-| bash, python3 (3.11+ has `tomllib`; else `tomli`) | Core |
+| bash, python3 ≥ 3.11 (`tomllib` only) | Core |
 | git | Git pins |
-| curl or wget | HTTPS `[[source]]` (optional) |
-| **bubblewrap** (`bwrap`) | Optional; `apt install bubblewrap` |
-| **Landlock** (kernel LSM) | Optional; `./libpin-landlock --status` |
-| Linux | Sandbox helpers are Linux-only no-ops elsewhere |
+| curl | HTTPS `[[source]]` |
+| **bubblewrap** (`bwrap`) | Required unless `--no-bwrap --no-landlock`; `apt install bubblewrap` |
+| **Landlock** (kernel LSM) | Required unless `--no-bwrap --no-landlock`; `./libpin-landlock --status` |
+| Linux | Missing sandbox tools is an error on every OS; pass both `--no-*` flags |
 
 ## License
 

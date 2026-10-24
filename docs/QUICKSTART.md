@@ -6,15 +6,17 @@ Get a working pin in minutes. No network required for the bundled examples.
 
 ```bash
 # Core
-python3 --version   # 3.11+ preferred (tomllib); or pip install tomli
+python3 --version   # 3.11+ required (tomllib only)
 bash --version
 git --version
+curl --version
 
-# Optional sandbox (Linux) — tools still work without these
+# Sandbox (Linux). Missing tools is an error unless you pass
+# --no-bwrap --no-landlock
 sudo apt install bubblewrap    # provides `bwrap`
 # Landlock is a kernel feature; check:
 ./kit/libpin-landlock --status
-# → "available abi=N" or "unavailable"
+# → "available abi=N" or "unavailable" (exit 1)
 ```
 
 ## 2. Layout mental model
@@ -49,6 +51,7 @@ third_party/                 ← kit/ dropped here (or use kit/ in place)
 cd kit    # or: cd your-repo/third_party
 
 # Materialize (creates tiny git tree in example/src from seed-src; applies patch)
+# Add --no-bwrap --no-landlock if sandbox tools are missing.
 ./fetch-deps ro example
 
 # Build + collect → example/artifact/hello.bin
@@ -97,7 +100,10 @@ consumer_note = "Builds libfoo.so for our app"
 [[artifact]]
 path = "artifact/libfoo.so"
 from = "src/build/libfoo.so"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 ```
+
+`sha256` is required. 64 zeros is the `--record` placeholder (`./fetch-deps build --record mylib` fills it).
 
 Minimal **file** pin:
 
@@ -126,13 +132,15 @@ Add `mylib/build` (executable) that writes products under `src/…`, then:
 
 ```text
 ./fetch-deps ro [NAME…]       # pin + patches + sources RO (default)
-./fetch-deps rw [NAME…]       # writable for co-development
+./fetch-deps rw [NAME…]       # writable branch `work` for co-development
 ./fetch-deps build [NAME…]    # run build[] + get-artifacts
+./fetch-deps check [NAME…]    # host_repo, git_home leak, depends, moved tags
+./fetch-deps outdated [NAME…] # compare pins to upstream
 ./fetch-deps status [-v]      # mode / HEAD / dirty
 ./get-artifacts [NAME…]       # collect only (iterate builds)
 ```
 
-Disable sandbox when debugging:
+Disable sandbox when debugging (both flags required):
 
 ```bash
 LIBPIN_NO_BWRAP=1 LIBPIN_NO_LANDLOCK=1 ./fetch-deps build example

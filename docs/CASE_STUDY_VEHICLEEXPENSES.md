@@ -88,12 +88,12 @@ paddle’s `./build` prefers `paddle-models` layout when present; falls back to 
 
 Artifact rows include both:
 
-1. **Pin-local** `artifact/jni/<abi>/…` + optional `sha256` for audit
+1. **Pin-local** `artifact/jni/<abi>/…` + required `sha256` for audit
 2. **App promote** `app/src/main/jniLibs/<abi>/…` with the same content hash
 
 ### Build confinement
 
-Materialize and `./build` run under `libpin-sandbox` when available:
+Materialize and `./build` run under `libpin-sandbox` (pass `--no-bwrap --no-landlock` only when the tools are missing):
 
 - materialize → mode `lib` (write under `third_party/paddle/`)
 - build → mode `src` (mutation under `third_party/paddle/src/`)
@@ -120,9 +120,11 @@ Same pin layout while actively editing library sources next to the app:
 
 ## Optional local git (`GIT_HOME`)
 
-Maintainers often keep full clones under `~/git/opencv`, `~/git/Paddle-Lite`, etc. fetch-deps may attach a worktree at `third_party/<lib>/src` so history/objects stay outside the app tree. Sandbox allows only that lib’s `.git` for metadata updates — not the entire home git directory.
+Maintainers often keep full clones under `~/git/opencv`, `~/git/Paddle-Lite`, etc. When the host is a git repo, fetch-deps clones it with `--no-hardlinks` into `third_party/<lib>/src` and never uses the network. Host `.git` is read-only inside the sandbox (no `LIBPIN_HOST_GIT` RW bind). opencv’s object store is copied per worktree (~573M); that is accepted.
 
-Joe Random without `GIT_HOME` still materializes via HTTPS clone of the pin SHA.
+`rclone` and `paddle` need `default = false` to stay out of the default NAME set. `paddle-opt` already has `host_repo = "paddle"`; its 64-zero sha256 must be filled by `--record`. `extractmail` should add `depends = ["remotetable"]`. opencv `track_branch = "4.10.0"` is a tag check (`refresh` fails if the tag moves; `upgrade --ref` to change it).
+
+Joe Random without `GIT_HOME` still materializes via HTTPS clone of the pin SHA (`git_https` only; `git_ssh` is metadata).
 
 ---
 
@@ -144,7 +146,7 @@ libpin itself does not mandate QEMU; the case study shows how **artifact collect
 2. **`libpin.toml` is the contract** — mode is `status.local`, not the pin file.
 3. **Non-git sources need the same discipline as git** — content hash is the pin; fail closed.
 4. **Independent `[[artifact]]` rows** — pin-local audit vs app promote without a second tool.
-5. **Sandbox is optional hardening** — long NDK builds must not hard-depend on LSM presence; when present, mutation surfaces are explicit.
+5. **Sandbox is required unless both `--no-bwrap` and `--no-landlock` are passed** — mutation surfaces are explicit; host clones stay read-only.
 6. **Document ABI product policy in SOURCE.md** — e.g. “true v7 has no product soft-fp16”; tailor is the size lever.
 7. **Nested consumers copy the kit** until libpin is a published dependency.
 

@@ -64,10 +64,11 @@ third_party/
 ### Co-develop library + app
 
 ```bash
-./third_party/fetch-deps rw <lib>      # writable branch (often named like the app branch)
-# edit under third_party/<lib>/src (or host worktree)
+./third_party/fetch-deps rw <lib>      # writable branch `work` in src (override --branch)
+# edit under third_party/<lib>/src
 ./third_party/fetch-deps build <lib>
 # bump pin when ready: libpin.toml + artifact/ + commit on the app branch
+# David: git -C third_party/<lib>/src push host HEAD:refs/heads/work
 ```
 
 ### Materialize-only (file pins, pure sources)
@@ -83,7 +84,7 @@ build = []
 
 ### Local full clone (`GIT_HOME`)
 
-Optional. If `~/git/<lib>` (or `GIT_HOME/<lib>`) exists, fetch-deps may materialize `src` as a **worktree** or fetch objects from that host so the app tree does not hold a full object store. **Without GIT_HOME**, clone/fetch of the pin SHA still works (optional `--depth`).
+Optional unless a host is required (`host_repo` set as a name, or a required `GIT_HOME/<name>` lookup). If the host is a git repo, fetch-deps clones it with `--no-hardlinks` into `src/` (never network). Linked worktrees and `--shared` (alternates) src trees are replaced. **Without GIT_HOME**, `git_https` / `source_kind = "seed-src"` / file pins still run. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
 
 ---
 
@@ -93,7 +94,7 @@ Optional. If `~/git/<lib>` (or `GIT_HOME/<lib>`) exists, fetch-deps may material
 |-------|------|----------|
 | **fetch-deps** | Materialize `src` @ `git_sha` and/or `[[source]]`; apply `patches/`; set RO (unless lib requires RW); run `build[]`; call **get-artifacts** | Invent build flags; leave app binaries only under `src` |
 | **build script(s)** | Given already-patched tree: make build/output dirs writable; compile; write products under `src/…` | Apply patches; write final pin names under `artifact/` (get-artifacts is normative) |
-| **get-artifacts** | Read libpin.toml; resolve `from` globs; **pick** if needed; copy to each `path`; optional `sha256` check | Materialize sources; execute pin build |
+| **get-artifacts** | Read libpin.toml; resolve `from` globs; **pick** if needed; copy to each `path`; required `sha256` check | Materialize sources; execute pin build |
 
 ---
 
@@ -105,27 +106,32 @@ Optional. If `~/git/<lib>` (or `GIT_HOME/<lib>`) exists, fetch-deps may material
 
 Commands:
   (default) | ro   Read-only pin (git @ git_sha and/or [[source]]; then RO)
-  rw               Writable branch (git) / writable src (files)
+  rw               Writable branch `work` (git) / writable src (files)
   status           Show mode / HEAD / pin / dirty (-v / -vv)
-  refresh          Advance pin SHA from library master tip + materialize ro (git)
+  refresh          Advance pin SHA along track_branch + materialize ro (git)
   upgrade NAME --ref REF   try ref, build, collect, update libpin.toml
   build            Run build[] from libpin.toml, then get-artifacts
+  check            host_repo, git_home leak, depends, moved tags
+  outdated         compare pins to upstream; record tip in status.local
 
 Options (common):
-  --allow-ssh          Permit git@ for *git* transport only
-  --git-home DIR       Override GIT_HOME
-  --branch NAME        rw branch name
-  --depth N            optional shallow clone (not default)
-  --no-bwrap           Disable bubblewrap
+  --git-home DIR       Override smudged git_home
+  --branch NAME        rw/upgrade branch (defaults: work / upgrade/<ref>)
+  --base REF           rw base (default: pin git_sha)
+  --ref REF            upgrade source ref
+  --record             build: write new [[artifact]] sha256 values into libpin.toml
+  --no-bwrap           Disable bubblewrap (required together with --no-landlock if tools are missing)
   --no-landlock        Disable Landlock
 ```
 
 ```text
 ./third_party/get-artifacts [NAME…]
-  # default NAME set: every pin with libpin.toml except "example"
+  # default NAME set: every pin with libpin.toml except default = false
+  --verify (default) / --record
   --no-bwrap / --no-landlock
-  LIBPIN_GET_ARTIFACTS_SANDBOX=1  # artifact mode only
 ```
+
+Pins with `default = false` are omitted from the default NAME set of both tools. Missing bwrap or Landlock is an error unless both `--no-bwrap` and `--no-landlock` are passed.
 
 ---
 
@@ -178,8 +184,10 @@ sha256 = "…"
 - Leave app-consumed binaries **only** under `src/` (they vanish without materialize).
 - Treat `~/git/...` as the pin if `src/` was never materialized.
 - `git add` a full non-submodule dump of library sources into the app repo.
-- Use SSH for `[[source]]` URLs (never; use HTTPS / file / seed).
+- Use SSH for `[[source]]` URLs (never; use HTTPS / file / seed). `git_ssh` on a git pin is metadata only.
 - Expect bit-identical SO files when `reproducible = false` (process still must be documented).
+- Skip a missing sandbox: pass both `--no-bwrap` and `--no-landlock`, or install the tools.
+- Network when a host repo exists (missing commit is an error).
 
 ---
 
@@ -188,11 +196,12 @@ sha256 = "…"
 From this repo’s `kit/`:
 
 ```bash
-./fetch-deps ro example files-pin
-./fetch-deps build example
+./tests/run.sh
+./fetch-deps --no-bwrap --no-landlock ro example files-pin
+./fetch-deps --no-bwrap --no-landlock build example
 test -s example/artifact/hello.bin
 test -f files-pin/src/hello.txt
-./libpin-landlock --status || true
+./libpin-landlock --status
 LIBPIN_BWRAP_DEBUG=1 LIBPIN_LANDLOCK_DEBUG=1 ./fetch-deps status -v
 ```
 

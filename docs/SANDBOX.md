@@ -1,6 +1,12 @@
 # libpin sandbox: bubblewrap + Landlock
 
-Optional **write confinement** for pin materialize and build on Linux. Pin semantics are unchanged when tools are missing: **unsandboxed, still correct**.
+**Write confinement** for pin materialize and build on Linux. Missing `bwrap` or Landlock is an **error** everywhere (Linux, non-Linux, CI):
+
+```text
+pass --no-bwrap --no-landlock to run unsandboxed
+```
+
+There is no platform auto-detection and no “soft-fail to bare exec.” `--no-bwrap --no-landlock` (or both `LIBPIN_NO_BWRAP=1` and `LIBPIN_NO_LANDLOCK=1`) skip the write probe and the sandbox.
 
 This document covers capabilities, composition, modes, environment variables, and limits.
 
@@ -8,10 +14,10 @@ This document covers capabilities, composition, modes, environment variables, an
 
 ## Design goals
 
-1. **Harden execution of retrieved trees** — especially untrusted or large third-party sources — so a buggy/malicious build cannot casually rewrite the rest of the app tree.
+1. **Harden execution of retrieved trees** — especially untrusted or large third-party sources — so a buggy/malicious build cannot casually rewrite the rest of the app tree or a host clone under `GIT_HOME`.
 2. **Keep toolchains working** — JDKs, SDKs, compilers, Docker clients must still **read and execute** host tools and libraries.
-3. **Optional and soft-fail** — no hard dependency on kernel LSM or `bwrap` for day-to-day correctness.
-4. **Single-level outer jail** — nested bubblewrap user namespaces fail; Landlock **stacks**.
+3. **Explicit unsandboxed mode** — operators who lack the tools pass both `--no-bwrap` and `--no-landlock`.
+4. **Single-level outer jail** — nested bubblewrap user namespaces fail; Landlock **stacks**. Nesting is detected with a write probe, not by reading `LIBPIN_SANDBOX`.
 
 Primary threat model for Landlock in libpin: **mutation** (write/create/remove/truncate/refer) outside the allowed surface. It is **not** a full confidentiality sandbox (reads stay open by design).
 
@@ -27,15 +33,16 @@ Primary threat model for Landlock in libpin: **mutation** (write/create/remove/t
                     libpin-sandbox    │
                                       ▼
                     ┌─────────────────────────────────────┐
-   outer (optional) │  libpin-bwrap                       │
+   outer            │  libpin-bwrap                       │
                     │  • --ro-bind / /                    │
+                    │  • --tmpfs /tmp, /var/tmp           │
+                    │  • --ro-bind CWD, kit, GIT_HOME     │
                     │  • --bind <RW hole> <RW hole>       │
-                    │  • tmpfs /tmp, /var/tmp             │
                     │  • sets LIBPIN_SANDBOX=<mode>       │
                     └─────────────────┬───────────────────┘
                                       │
                     ┌─────────────────▼───────────────────┐
-   inner (optional) │  libpin-landlock                    │
+   inner            │  libpin-landlock                    │
                     │  • handles mutation FS rights only  │
                     │  • path_beneath allow-list          │
                     │  • always + /tmp, /var/tmp, /dev/*  │
@@ -47,11 +54,14 @@ Primary threat model for Landlock in libpin: **mutation** (write/create/remove/t
 
 | Layer | Mechanism | What it constrains |
 |-------|-----------|--------------------|
-| **bubblewrap** | Mount namespaces / bind mounts | Visible filesystem is RO except explicit RW binds |
+| **bubblewrap** | Mount namespaces / bind mounts | Visible filesystem is RO except explicit RW binds and tmpfs temps |
 | **Landlock** | Kernel LSM ruleset on the process | Even if a path is visible and otherwise writable, **mutation** is denied unless under an allowed path |
 
-**Order:** bwrap outer → Landlock inner.  
-**Why:** Landlock is stackable and survives across exec; nested bwrap is avoided via `LIBPIN_SANDBOX`.
+**Order:** bwrap outer → Landlock inner.
+
+**Why:** Landlock is stackable and survives across exec; nested bwrap is avoided by probing whether a write outside the hole already fails.
+
+Host clones are **read-only**. There is no `LIBPIN_HOST_GIT` RW bind and no `resolve_host_git`. `--ro-bind / /` plus `--bind third_party/<lib>` is the write surface; `GIT_HOME` is restored read-only after tmpfs `/tmp` so host clones stay visible for `git clone` without being writable.
 
 Entry point: `libpin-sandbox --mode MODE [--lib NAME] -- command…`
 
@@ -75,19 +85,27 @@ Modes are shared by bwrap, Landlock, and `libpin-sandbox`.
 | Materialize + write `status.local` | `lib` | Need to create `src/`, write pin metadata under the lib dir |
 | Apply patches | `src` | Only the source tree |
 | Run `build[]` | `src` | Build products under `src/…` |
-| `get-artifacts` | **none by default** | May write `app/…`; opt-in sandbox below |
+| `get-artifacts` | **none** | May write `app/…` under the repo root |
 
-### get-artifacts and sandbox
+get-artifacts does not sandbox. Destinations must still `realpath` inside the repo root.
 
-Collect is **our** copy of already-built products (not executing retrieved build systems). Default: **no** sandbox so destinations like `app/src/main/jniLibs/…` work.
+---
 
-Opt-in (pin-local artifact only):
+## Nest detection (write probe)
+
+`LIBPIN_SANDBOX` **alone never skips** sandboxing. Confinement is detected with a write at a unique path **outside** the current mode’s writable hole. This redirect is a deliberate test, not a swallow; it is the only allowed `2>/dev/null` in the kit:
 
 ```bash
-LIBPIN_GET_ARTIFACTS_SANDBOX=1 ./get-artifacts mylib
+probe="$PARENT/.libpin-probe.$$.$RANDOM"
+if printf x >"$probe" 2>/dev/null; then
+    rm -f "$probe"        # set -e: fails loudly if it can't be removed
+    apply sandbox
+else
+    already confined; skip nesting
+fi
 ```
 
-That re-enters with `mode=artifact`. Paths outside `third_party/<lib>/artifact/` will fail under confinement — use without sandbox for `app/…` rows.
+Do not create the file with `mktemp` first: `mktemp` itself would fail inside the sandbox. `--no-bwrap --no-landlock` skip both the probe and the sandbox.
 
 ---
 
@@ -101,7 +119,7 @@ command -v bwrap
 bwrap --version
 ```
 
-If `bwrap` is missing, `libpin-bwrap` **execs the command bare** (debug message if `LIBPIN_BWRAP_DEBUG=1`).
+If `bwrap` is missing, `libpin-bwrap` **exits 1** with `pass --no-bwrap --no-landlock to run unsandboxed`. `LIBPIN_NO_BWRAP=1` skips this helper (exec bare) — fetch-deps still requires `--no-landlock` as well unless landlock is also disabled.
 
 ### What it does
 
@@ -117,9 +135,11 @@ bwrap
   --share-net
   --die-with-parent
   --chdir $CWD
-  --bind <RW_DIR> <RW_DIR>     # mode-specific hole
-  [--bind $LIBPIN_HOST_GIT …]  # linked worktree .git only
-  [--bind docker.sock …]       # if present (Docker client → host daemon)
+  --ro-bind $CWD $CWD            # restore if tmpfs hid it
+  --ro-bind $TP_ROOT $TP_ROOT
+  --ro-bind $GIT_HOME $GIT_HOME  # when set; always read-only
+  --bind <RW_DIR> <RW_DIR>       # mode-specific hole
+  [--bind docker.sock …]         # if present (Docker client → host daemon)
   [--bind $XDG_RUNTIME_DIR …]
   -- command…
 ```
@@ -129,9 +149,10 @@ bwrap
 | RO root | Entire host FS mounted read-only |
 | RW hole | Only the mode path (lib / src / artifact / third_party) is `--bind` (read-write) |
 | tmpfs temps | `/tmp` and `/var/tmp` are empty writable temps inside the jail |
-| Network | Shared (`--share-net`) so fetches/clones still work |
-| Nesting | If `LIBPIN_SANDBOX` is already set → skip bwrap (no nest) |
-| Host git | Optional `LIBPIN_HOST_GIT` — **only** that lib’s `.git` (or resolved gitdir), never whole `GIT_HOME` |
+| Restore | CWD, kit root, and `GIT_HOME` are re-bound read-only after tmpfs (tests and hosts under `/tmp` stay visible) |
+| Network | Shared (`--share-net`) so HTTPS clones still work when no host exists |
+| Nesting | Write probe in `libpin-sandbox`; `LIBPIN_SANDBOX` is informational |
+| Host git | **No RW bind.** `GIT_HOME` is read-only when set |
 | Docker | Binds `docker.sock` when present so builds that shell out to Docker keep working |
 | Disable | `LIBPIN_NO_BWRAP=1` or `--no-bwrap` |
 
@@ -140,6 +161,7 @@ bwrap
 - Requires user namespaces (or setuid bwrap, depending on distro policy). Some hardened hosts restrict unprivileged user namespaces.
 - Does **not** replace Landlock: a process that escapes via a writable hole still has that hole; Landlock further restricts mutation even on mounts that appear RW if the hole is too wide (e.g. whole `lib/` when only `src/` should mutate for builds).
 - Nested bwrap fails — libpin never nests intentionally.
+- `--tmpfs /tmp` hides host paths under `/tmp` until they are restored (CWD, kit, `GIT_HOME`).
 
 ---
 
@@ -156,18 +178,18 @@ No userspace package for the LSM itself — you need a kernel built with Landloc
 ```bash
 ./kit/libpin-landlock --status
 # available abi=8
-# or: unavailable
+# or: unavailable  (exit 1)
 ```
 
 Also check:
 
 ```bash
-zcat /proc/config.gz 2>/dev/null | grep LANDLOCK || true
+zcat /proc/config.gz | grep LANDLOCK
 # CONFIG_SECURITY_LANDLOCK=y
-grep -i landlock /sys/kernel/security/lsm 2>/dev/null || true
+grep -i landlock /sys/kernel/security/lsm
 ```
 
-Python 3 + ctypes (stdlib) is enough; no extra Python Landlock package.
+Python 3 + ctypes (stdlib) is enough; no extra Python Landlock package. Shebang is `#!/usr/bin/python3` so an empty `PATH` inside bwrap still finds the interpreter.
 
 ### What libpin handles
 
@@ -191,15 +213,11 @@ When any ruleset is applied, libpin also allows mutation under:
 - `/tmp`, `/var/tmp`
 - Essential devices as **files**: `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/urandom`, `/dev/random`, `/dev/tty`
 
-Builds need temp files and `> /dev/null`; corruption bound remains “not the app tree outside the pin hole.”
+Builds need temp files and `> /dev/null`; the bound remains “not the app tree outside the pin hole.” `/tmp` being writable in Landlock does not make a host clone writable: bwrap’s read-only bind of `GIT_HOME` still applies.
 
-### Host git allow
+### Unavailable / apply failure
 
-For linked worktrees, git must update the object store / worktree registry under the host clone’s `.git`. `libpin-sandbox` resolves `GIT_HOME/<lib>/.git` (or gitdir from a gitfile, stripping `/worktrees/…`) and passes it as an extra Landlock path and bwrap RW bind — **narrow**, not whole `GIT_HOME`.
-
-### Soft-fail
-
-If ruleset creation or restrict fails, libpin prints a warning and **execs bare** (same spirit as missing bwrap). Correctness over hard fail on sandbox.
+If Landlock is unavailable or applying the ruleset fails, `libpin-landlock` **exits 1** with `pass --no-bwrap --no-landlock to run unsandboxed`. It does not exec the command bare.
 
 ### Disable
 
@@ -215,9 +233,9 @@ LIBPIN_NO_LANDLOCK=1
 | Confidentiality | Reads are unrestricted — secrets on the host remain readable |
 | Network / IPC | Not covered by this helper |
 | ABI / arch | Syscall numbers wired for x86_64 and aarch64 (common modern NRs 444–446) |
-| Kernel age | Needs Landlock-capable kernel; older kernels → unavailable → bare exec |
-| Composition | Stacks under bwrap; can also run Landlock-only if bwrap is disabled/missing |
-| `get-artifacts` | Off by default (see modes) |
+| Kernel age | Needs Landlock-capable kernel; older kernels → error unless `--no-landlock` |
+| Composition | Stacks under bwrap; can also run Landlock-only if bwrap is disabled |
+| `get-artifacts` | Off (destinations may be `app/…`) |
 
 ---
 
@@ -227,13 +245,12 @@ LIBPIN_NO_LANDLOCK=1
 |----------|--------|
 | `LIBPIN_NO_BWRAP=1` | Skip bubblewrap |
 | `LIBPIN_NO_LANDLOCK=1` | Skip Landlock |
-| `LIBPIN_SANDBOX=<mode>` | Already inside bwrap — do not nest |
+| `LIBPIN_SANDBOX=<mode>` | Informational (set by bwrap). **Does not skip** sandboxing |
+| `LIBPIN_INSIDE=1` | Set by fetch-deps on re-entry; fetch-deps then passes `--no-bwrap` so bwrap does not nest; Landlock may still stack |
 | `LIBPIN_LANDLOCK=1` | Set by landlock after successful restrict |
-| `LIBPIN_BWRAP_DEBUG=1` | Print bwrap argv / skip reasons |
-| `LIBPIN_LANDLOCK_DEBUG=1` | Print allow paths / skip reasons |
-| `LIBPIN_HOST_GIT=/path` | Extra RW for linked worktree `.git` |
-| `GIT_HOME` | Used to **resolve** host git path; not wholly allowed |
-| `LIBPIN_GET_ARTIFACTS_SANDBOX=1` | Confine collect to `artifact/` mode |
+| `LIBPIN_BWRAP_DEBUG=1` | Print bwrap argv |
+| `LIBPIN_LANDLOCK_DEBUG=1` | Print allow paths |
+| `GIT_HOME` | Host clone root; bound read-only inside bwrap when set |
 
 ---
 
@@ -247,9 +264,9 @@ LIBPIN_NO_LANDLOCK=1
 ./libpin-sandbox --mode src --lib example -- \
   bash -c 'echo ok > example/src/build/probe.txt'
 
-# Expect failure writing outside src (when Landlock or bwrap active)
+# Expect failure writing outside the hole
 ./libpin-sandbox --mode src --lib example -- \
-  bash -c 'echo bad > example/../should-fail.txt'   # may fail depending on layer
+  bash -c 'echo bad > example/../should-fail.txt'
 ```
 
 Landlock alone (no bwrap):
@@ -264,6 +281,15 @@ bwrap alone:
 LIBPIN_NO_LANDLOCK=1 ./libpin-sandbox --mode lib --lib example -- touch example/status.local
 ```
 
+Fully unsandboxed:
+
+```bash
+# fetch-deps / get-artifacts:
+./fetch-deps --no-bwrap --no-landlock ro example
+# helpers (env only; libpin-sandbox does not take those flags):
+LIBPIN_NO_BWRAP=1 LIBPIN_NO_LANDLOCK=1 ./libpin-sandbox --mode lib --lib example -- true
+```
+
 ---
 
 ## Security expectations (honest)
@@ -273,6 +299,7 @@ libpin’s sandbox is **hardening for pin tooling**, not a multi-tenant VM bound
 **Good at:**
 
 - Stopping accidental `rm -rf` / write spray into the rest of the monorepo during materialize/build
+- Denying writes into host clones under `GIT_HOME` (agents are `ai-*`; hosts are `dlang:dlang`)
 - Reducing blast radius of a compromised or buggy upstream build script against the app tree
 - Making “what can this step write?” explicit in code (modes)
 
@@ -289,4 +316,4 @@ For untrusted CI of adversarial source trees, combine with stronger isolation (c
 
 ## Non-Linux
 
-Both helpers detect platform / tool availability and run the command unsandboxed. Pin materialize and build remain the source of truth for correctness.
+Missing bwrap or Landlock is an error with the same unsandboxed hint. Pass `--no-bwrap --no-landlock` on those hosts. Pin materialize and build remain the source of truth for correctness.
