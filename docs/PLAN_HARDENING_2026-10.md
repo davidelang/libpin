@@ -68,3 +68,58 @@ Extend the kit tests/examples to cover: errexit abort; zero-match failure; ambig
 
 ## Report back
 Commits made; each item done or not with reason; test results; behavior changes that will affect existing pins in VehicleExpenses-automated, liveimap, torque-ford-gas-tracking, extractmail and remotetable when published; and any permission changes David must make (with exact commands).
+
+---
+
+## Rev 2 (2026-10-24): answers to the implementer's review. Where this conflicts with anything above, this section wins.
+
+### Work in phases, each with tests, each committed
+1. Step 0 merge: orchestration-example's fetch-deps/get-artifacts (--record, upgrade restore, swallow cleanups) as the base; add host_repo from 42450702; keep git_repo_error / real git stderr from e21ad52d; do NOT keep e21ad52d's alternates (--shared).
+2. Host read-only: resolve-host helper, clone --no-hardlinks, safe.directory, drop LIBPIN_HOST_GIT writes and resolve_host_git from libpin-sandbox, replace linked/--shared src.
+3. Fail-loud: errexit, swallow removal, no network fallbacks, one transport, Python >= 3.11, curl only, sandbox tools required, show-toplevel guard, exact path matches.
+4. Artifacts: required sha256, --record fills placeholders and inserts new rows, zero-match fails, pick, drop aliases, resolve_dest under REPO_ROOT, default = false.
+5. Features A-E (shared `fetch-deps check` command for leak warning, host_repo validation, depends, moved tag).
+6. Docs: PIN_FORMAT, SANDBOX, GUIDE, QUICKSTART, README.
+
+### Materialize decision tree
+```
+host = host_repo (name under GIT_HOME, or absolute path) else GIT_HOME/<name>
+absolute host path under GIT_HOME          -> error (use the name)
+GIT_HOME/<name> exists but is not a git repo -> error
+leftover smudge token (@@GIT_HOME@@)       -> error
+if host_repo set OR host is a git repo:
+    require read access (else print the chmod/setfacl David would run)
+    resolve sha (partial -> unique full sha, else error)
+    reuse src if it is a standalone clone (toplevel == src, no alternates, not linked) and has the commit; else
+    clone --no-hardlinks --no-checkout host src; checkout --detach sha
+    never network
+elif declared network transport (git_https) or declared seed-src:
+    that transport only
+else: error
+```
+
+### Answers
+1. Network: exactly the tree above. host_repo set or GIT_HOME/<name> is a git repo -> host only. Neither -> git_https. Non-git dir at GIT_HOME/<name> -> fail. Smudge token -> fail.
+2. Transport: git_https is the network transport. git_ssh is recorded metadata, not used by the tool. seed-src is used only when declared explicitly (e.g. `source = "seed-src"`); an empty git_https does not imply it. Update kit/example accordingly.
+3. Sandbox tools: missing bwrap/landlock is an error everywhere (Linux, non-Linux, CI) with the message "pass --no-bwrap --no-landlock to run unsandboxed". No platform auto-detection. Docs updated to match.
+4. Multiple names: a failed pin aborts that pin only; later names still run; exit non-zero at the end with every failure listed.
+5. Pick: omitted pick -> exactly one match required. pick = "newest" stays valid when written explicitly. Unknown values are errors. kit/example sets pick = "newest".
+6. Placeholder: only 64 zeros. --record replaces it. A missing sha256 key is an error except under --record, which inserts the line into that [[artifact]] table (temp file + rename). Empty or "TBD" are errors.
+7. Tags: track_branch is looked up in the host as refs/tags/X and refs/heads/X. Both exist -> error. Branch -> refresh moves along that branch. Tag -> refresh only verifies the tag still resolves to the pinned sha (fail "tag moved" otherwise); changing it requires `upgrade --ref`. Delete the master and host/master/.git special cases and offer_mainish_retarget.
+8. rw: at clone time set origin = git_https (when present) and add remote `host` = resolved host path. rw/upgrade do `checkout -B <branch>` in src. Print, for David: `git -C <src> push host HEAD:refs/heads/<branch>`.
+9. Old linked worktrees: rm -rf src is fine; print `git -C <host> worktree prune` for David. Leftover host metadata is acceptable until he runs it.
+10. Reuse a standalone full clone already at, or containing, the sha (checkout --detach); fetch a missing commit from host into it. Only re-clone linked/--shared/wrong-toplevel src.
+11. LIBPIN_SANDBOX: yes, detect confinement with a write probe outside the pin's writable area; probe failing = already confined, skip nesting; probe succeeding = apply bwrap. The env var alone never skips the sandbox. Remove the probe file on success and fail loudly if it can't be removed.
+12. depends: `git show <pin-sha>:third_party/<dep>/libpin.toml` in the host. Compare git_sha only (resolved to full shas).
+13. Companion version: one `kit/VERSION` file. fetch-deps, get-artifacts and libpin-sandbox each refuse to run on mismatch, including when invoked alone.
+14. Tests go in kit/tests/, seeded from orchestration-example tools/test-fetch-deps-record with throwaway --git-home fixtures. The other-owner case: a documented manual probe plus safe.directory unit coverage if a chown fixture is impossible without root. Docs are in scope (phase 6).
+15. Remove all project coupling: VE_ROOT, ve_branch, chgrp ai-code/chmod 664 (leave group bits to umask/ACLs), hard-coded git_home (must come from configuration/flag; fail if unset), and the rclone/paddle/example skip list (replaced by default = false). --worktree-search: report what it does; remove it if it is a project-specific special case.
+
+### Also agreed
+- show-toplevel == src check in every path that records a sha (ro, refresh, upgrade, write_pin_sha).
+- apply_patches honors `patches = [...]` order when present, else one sorted list of *.patch and *.diff; path rejection on both.
+- write_pin_sha: temp file + rename, top-level only, no chgrp.
+- Upgrade: write status.local only after a successful patch; on failure keep src and its branch for debugging; on success delete the branch in src and detach at the new pin.
+- safe.directory only on git calls against the host, never on the agent-owned src, never `*`.
+- Keep the image-pin plan separate; don't touch it.
+- Include the consumer-impact table from the review in the report, updated for these answers (rclone/paddle need default = false; paddle-opt needs a real sha256 via --record; extractmail gets depends = ["remotetable"]; opencv becomes a tag check; David runs worktree prune once per host).
