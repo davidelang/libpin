@@ -46,4 +46,4 @@ See the parent repo:
 
 ## Requirements
 
-bash, python3 ≥ 3.11 (`tomllib` only), git (for git pins), curl. Sandbox: `bubblewrap` and a Landlock-capable kernel, or pass `--no-bwrap --no-landlock`.
+bash, python3 ≥ 3.11 (`tomllib` only), git (for git pins), curl. Sandbox: `bubblewrap` and a Landlock-capable kernel are used when available; `--require-bwrap` / `--require-landlock` stop if one is missing.

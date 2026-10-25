@@ -13,8 +13,8 @@ Usage:
 Modes (same as libpin-bwrap; resolved under third_party/):
   third_party | lib | src | artifact
 
-Missing landlock is an error: pass --no-bwrap --no-landlock to run unsandboxed.
-LIBPIN_NO_LANDLOCK=1 skips this helper (exec bare).
+Called after an entry point decided Landlock is usable. An apply failure
+here is a real fault. LIBPIN_NO_LANDLOCK=1 skips this helper (exec bare).
 
 Env:
   LIBPIN_NO_LANDLOCK=1   skip (exec command bare)
@@ -103,10 +103,6 @@ def _debug(msg: str) -> None:
 def _die(msg: str, code: int = 1) -> None:
     print(f"libpin-landlock: {msg}", file=sys.stderr)
     raise SystemExit(code)
-
-
-def _unsandboxed(msg: str) -> None:
-    _die(f"{msg}; pass --no-bwrap --no-landlock to run unsandboxed")
 
 
 def check_kit_version() -> None:
@@ -308,7 +304,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.execvp(cmd[0], cmd)
 
     if ver is None:
-        _unsandboxed("landlock unavailable")
+        _die("landlock unavailable")
 
     required: List[str] = list(args.path)
     if args.mode:
@@ -340,7 +336,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         apply_landlock(required, optional_dirs, file_paths)
     except OSError as exc:
-        _unsandboxed(f"failed to apply landlock: {exc}")
+        _die(f"failed to apply landlock: {exc}")
 
     os.environ["LIBPIN_LANDLOCK"] = "1"
     os.execvp(cmd[0], cmd)

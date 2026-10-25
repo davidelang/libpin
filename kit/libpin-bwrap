@@ -11,9 +11,9 @@
 #   libpin-bwrap --mode third_party -- command…
 #   libpin-bwrap --mode lib|src|artifact --lib NAME -- command…
 #
-# Missing bwrap is an error: pass --no-bwrap --no-landlock to run unsandboxed.
-# LIBPIN_NO_BWRAP=1 skips this helper (exec bare). Nest detection is in libpin-sandbox
-# (write probe); LIBPIN_SANDBOX alone never skips.
+# Called after an entry point decided bwrap is usable. A missing bwrap here
+# is a real fault. LIBPIN_NO_BWRAP=1 skips this helper (exec bare). Nest
+# detection is in libpin-sandbox (write probe); LIBPIN_SANDBOX alone never skips.
 #
 # Env:
 #   LIBPIN_NO_BWRAP=1          skip sandbox (run bare)
@@ -70,13 +70,13 @@ check_kit_version
 
 if [[ "${LIBPIN_NO_BWRAP:-0}" == "1" ]]; then
   if [[ "${LIBPIN_BWRAP_DEBUG:-0}" == "1" ]]; then
-    echo "libpin-bwrap: debug: LIBPIN_NO_BWRAP=1 — unsandboxed" >&2
+    echo "libpin-bwrap: debug: LIBPIN_NO_BWRAP=1 — exec bare" >&2
   fi
   exec "$@"
 fi
 
 if ! command -v bwrap >/dev/null; then
-  echo "libpin-bwrap: bwrap not found; pass --no-bwrap --no-landlock to run unsandboxed" >&2
+  echo "libpin-bwrap: bwrap not found" >&2
   exit 1
 fi
 

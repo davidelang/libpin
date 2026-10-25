@@ -27,8 +27,8 @@
 # shortcut and uses the remote URL.
 # GIT_TERMINAL_PROMPT=0 so an agent never hangs on a credential prompt.
 #
-# Sandbox: bwrap + Landlock via libpin-sandbox. Missing tools is an error:
-#   pass --no-bwrap --no-landlock to run unsandboxed
+# Sandbox: bwrap + Landlock via libpin-sandbox, used when available
+#   (see docs/SANDBOX.md). --no-* disables one; --require-* stops if missing.
 LIBPIN_VERSION=2026.10.24
 set -euo pipefail
 if [[ -z "${LIBPIN_INSIDE:-}" ]]; then
@@ -43,6 +43,8 @@ REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 CMD=""
 NO_BWRAP=0
 NO_LANDLOCK=0
+REQUIRE_BWRAP=0
+REQUIRE_LANDLOCK=0
 BASE_REF=""
 BRANCH_OVERRIDE=""
 REF_UPGRADE=""
@@ -82,6 +84,9 @@ Options:
   --record             build: write the new [[artifact]] sha256 values into libpin.toml
   --no-bwrap           Disable bubblewrap (or LIBPIN_NO_BWRAP=1)
   --no-landlock        Disable Landlock (or LIBPIN_NO_LANDLOCK=1)
+  --require-bwrap      Stop if bubblewrap is not available
+  --require-landlock   Stop if Landlock is not available
+  --require-libpin     Same as --require-landlock
   -v, -vv              status verbosity
   -h, --help
 
@@ -93,7 +98,7 @@ Non-git pins ([[source]] tables):
   path     destination under third_party/<lib>/src/
   sha256   required content hash (hex)
 
-Sandbox (required unless both --no-bwrap and --no-landlock):
+Sandbox (used when available; see docs/SANDBOX.md):
   materialize + status.local  write → third_party/<lib>/  (mode=lib)
   patches                     write → third_party/<lib>/src/ only
   build steps                 write → third_party/<lib>/src/ only
@@ -123,6 +128,8 @@ while [[ $# -gt 0 ]]; do
       if [[ -z "$CMD" ]]; then CMD="$1"; shift; else NAMES+=("$1"); shift; fi ;;
     --no-bwrap) NO_BWRAP=1; shift ;;
     --no-landlock) NO_LANDLOCK=1; shift ;;
+    --require-bwrap) REQUIRE_BWRAP=1; shift ;;
+    --require-landlock|--require-libpin) REQUIRE_LANDLOCK=1; shift ;;
     --git-home) git_home="$2"; shift 2 ;;
     --branch) BRANCH_OVERRIDE="$2"; shift 2 ;;
     --base) BASE_REF="$2"; shift 2 ;;
@@ -179,6 +186,117 @@ if [[ -n "$GIT_HOME" && "$GIT_HOME" == *"@@"* ]]; then
   die "leftover smudge token in git_home ($GIT_HOME)"
 fi
 
+if [[ "$REQUIRE_BWRAP" -eq 1 && "$NO_BWRAP" -eq 1 ]]; then
+  echo "fetch-deps: --require-bwrap conflicts with --no-bwrap" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_LANDLOCK" -eq 1 && "$NO_LANDLOCK" -eq 1 ]]; then
+  echo "fetch-deps: --require-landlock conflicts with --no-landlock" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_BWRAP" -eq 1 && "${LIBPIN_NO_BWRAP:-0}" == "1" ]]; then
+  echo "fetch-deps: --require-bwrap conflicts with LIBPIN_NO_BWRAP=1" >&2
+  exit 2
+fi
+if [[ "$REQUIRE_LANDLOCK" -eq 1 && "${LIBPIN_NO_LANDLOCK:-0}" == "1" ]]; then
+  echo "fetch-deps: --require-landlock conflicts with LIBPIN_NO_LANDLOCK=1" >&2
+  exit 2
+fi
+
+BWRAP_STATE=available
+BWRAP_REASON=""
+LANDLOCK_STATE=available
+LANDLOCK_REASON=""
+
+if [[ "$NO_BWRAP" -eq 1 ]]; then
+  BWRAP_STATE=disabled
+  BWRAP_REASON="--no-bwrap"
+elif [[ "${LIBPIN_NO_BWRAP:-0}" == "1" ]]; then
+  NO_BWRAP=1
+  BWRAP_STATE=disabled
+  BWRAP_REASON="LIBPIN_NO_BWRAP=1"
+else
+  if ! command -v bwrap >/dev/null; then
+    BWRAP_STATE=unavailable
+    BWRAP_REASON="bwrap not found on PATH"
+  elif [[ ! -x "$ROOT/libpin-bwrap" ]]; then
+    BWRAP_STATE=unavailable
+    BWRAP_REASON="libpin-bwrap not executable"
+  else
+    bwrap_rc=0
+    bwrap_err="$(bwrap --ro-bind / / true 2>&1)" || bwrap_rc=$?
+    if [[ "$bwrap_rc" -ne 0 ]]; then
+      BWRAP_STATE=unavailable
+      bwrap_err="$(printf '%s' "$bwrap_err" | tr '\n' ' ')"
+      bwrap_err="${bwrap_err%" "}"
+      if [[ -n "$bwrap_err" ]]; then
+        BWRAP_REASON="$bwrap_err"
+      else
+        BWRAP_REASON="bwrap --ro-bind / / true exited $bwrap_rc"
+      fi
+    fi
+  fi
+fi
+
+if [[ "$NO_LANDLOCK" -eq 1 ]]; then
+  LANDLOCK_STATE=disabled
+  LANDLOCK_REASON="--no-landlock"
+elif [[ "${LIBPIN_NO_LANDLOCK:-0}" == "1" ]]; then
+  NO_LANDLOCK=1
+  LANDLOCK_STATE=disabled
+  LANDLOCK_REASON="LIBPIN_NO_LANDLOCK=1"
+else
+  if [[ ! -x "$ROOT/libpin-landlock" ]]; then
+    LANDLOCK_STATE=unavailable
+    LANDLOCK_REASON="libpin-landlock not executable"
+  else
+    ll_rc=0
+    ll_out="$("$ROOT/libpin-landlock" --status 2>&1)" || ll_rc=$?
+    if [[ "$ll_rc" -ne 0 ]]; then
+      LANDLOCK_STATE=unavailable
+      ll_out="$(printf '%s' "$ll_out" | tr '\n' ' ')"
+      ll_out="${ll_out%" "}"
+      if [[ -n "$ll_out" ]]; then
+        LANDLOCK_REASON="$ll_out"
+      else
+        LANDLOCK_REASON="libpin-landlock --status exited $ll_rc"
+      fi
+    else
+      LANDLOCK_REASON="${ll_out#available }"
+      LANDLOCK_REASON="${LANDLOCK_REASON/=/ }"
+    fi
+  fi
+fi
+
+if [[ "$REQUIRE_BWRAP" -eq 1 && "$BWRAP_STATE" != "available" ]]; then
+  die "bwrap required (--require-bwrap) but unavailable ($BWRAP_REASON)"
+fi
+if [[ "$REQUIRE_LANDLOCK" -eq 1 && "$LANDLOCK_STATE" != "available" ]]; then
+  die "Landlock required (--require-landlock) but unavailable ($LANDLOCK_REASON)"
+fi
+
+if [[ -z "${LIBPIN_INSIDE:-}" ]]; then
+  case "$BWRAP_STATE" in
+    disabled) echo "libpin: sandbox: bwrap disabled ($BWRAP_REASON)" >&2 ;;
+    unavailable) echo "libpin: sandbox: bwrap unavailable ($BWRAP_REASON); continuing without it" >&2 ;;
+    available) echo "libpin: sandbox: bwrap available; write confinement on" >&2 ;;
+  esac
+  case "$LANDLOCK_STATE" in
+    disabled) echo "libpin: sandbox: Landlock disabled ($LANDLOCK_REASON)" >&2 ;;
+    unavailable) echo "libpin: sandbox: Landlock unavailable ($LANDLOCK_REASON); continuing without it" >&2 ;;
+    available) echo "libpin: sandbox: Landlock available ($LANDLOCK_REASON); write confinement on" >&2 ;;
+  esac
+  if [[ "$BWRAP_STATE" != "available" && "$LANDLOCK_STATE" != "available" ]]; then
+    echo "libpin: sandbox: none active; pin writes are not confined" >&2
+  fi
+fi
+
+if [[ "$BWRAP_STATE" != "available" ]]; then
+  NO_BWRAP=1
+fi
+if [[ "$LANDLOCK_STATE" != "available" ]]; then
+  NO_LANDLOCK=1
+fi
 if [[ "$NO_BWRAP" -eq 1 ]]; then
   export LIBPIN_NO_BWRAP=1
 fi
@@ -186,14 +304,6 @@ if [[ "$NO_LANDLOCK" -eq 1 ]]; then
   export LIBPIN_NO_LANDLOCK=1
 fi
 export GIT_HOME
-
-if [[ "$NO_BWRAP" -eq 0 ]]; then
-  command -v bwrap >/dev/null || die "bwrap not found; pass --no-bwrap --no-landlock to run unsandboxed"
-fi
-if [[ "$NO_LANDLOCK" -eq 0 ]]; then
-  [[ -x "$ROOT/libpin-landlock" ]] || die "libpin-landlock not executable; pass --no-bwrap --no-landlock to run unsandboxed"
-  "$ROOT/libpin-landlock" --status >/dev/null || die "landlock unavailable; pass --no-bwrap --no-landlock to run unsandboxed"
-fi
 
 sandbox_run() {
   local mode="$1" name="$2"
