@@ -17,7 +17,7 @@
 #   usable host shortcut, else git_https if set, else git_ssh if set, else
 #   source_kind=seed-src. A failed git_https fetch does not retry git_ssh.
 #   Host is never mandatory when a remote URL is set. Permission/SSH failures
-#   print the exact command David can run (chown/chmod/setfacl/ssh); the agent
+#   print the exact command the owner can run (chmod/setfacl/ssh); the agent
 #   then uses the remote URL when present. Ambiguous sha on a readable host
 #   is a hard fail (do not network for a different commit).
 # Pins with default = false are omitted from the default NAME set.
@@ -31,6 +31,11 @@
 #   pass --no-bwrap --no-landlock to run unsandboxed
 LIBPIN_VERSION=2026.10.24
 set -euo pipefail
+if [[ -z "${LIBPIN_INSIDE:-}" ]]; then
+  LIBPIN_INVOCATION=$(printf '%q ' "$0" "$@")
+  LIBPIN_INVOCATION="${LIBPIN_INVOCATION% }"
+  export LIBPIN_INVOCATION
+fi
 export GIT_TERMINAL_PROMPT=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +50,7 @@ RECORD=0
 VERBOSE=0
 NAMES=()
 FAILED_NAMES=()
+PRINT_ARGS=()
 # Smudged LHS must be lowercase git_home= so a consumer clean filter can restore the path.
 # Do not hard-code a machine path. --git-home overrides.
 git_home=
@@ -122,6 +128,36 @@ while [[ $# -gt 0 ]]; do
     --base) BASE_REF="$2"; shift 2 ;;
     --ref) REF_UPGRADE="$2"; shift 2 ;;
     --record) RECORD=1; shift ;;
+    --print-host-perm-suggestions)
+      CMD=print-host-perm-suggestions
+      shift
+      PRINT_ARGS=()
+      n=0
+      while [[ $n -lt 8 && $# -gt 0 ]]; do
+        PRINT_ARGS+=("$1")
+        shift
+        n=$((n + 1))
+      done
+      if [[ $n -ne 8 ]]; then
+        echo "fetch-deps: --print-host-perm-suggestions needs 8 arguments" >&2
+        exit 2
+      fi
+      ;;
+    --print-owner-host-perm)
+      CMD=print-owner-host-perm
+      shift
+      PRINT_ARGS=()
+      n=0
+      while [[ $n -lt 3 && $# -gt 0 ]]; do
+        PRINT_ARGS+=("$1")
+        shift
+        n=$((n + 1))
+      done
+      if [[ $n -ne 3 ]]; then
+        echo "fetch-deps: --print-owner-host-perm needs 3 arguments" >&2
+        exit 2
+      fi
+      ;;
     -vv) VERBOSE=2; shift ;;
     -v) VERBOSE=1; shift ;;
     --) shift; break ;;
@@ -337,51 +373,294 @@ local_repo_for() {
   return 1
 }
 
+abs_host_path() {
+  local p="$1"
+  [[ "$p" == /* ]] || p="$PWD/$p"
+  printf '%s' "$p"
+}
+
+print_rerun_line() {
+  if [[ -n "${LIBPIN_INVOCATION:-}" ]]; then
+    echo "  then: $LIBPIN_INVOCATION" >&2
+  else
+    echo "  then: original command could not be determined" >&2
+  fi
+}
+
+# Read gitdir: from a gitfile. rc 1 = no gitdir: line.
+read_gitdir_file() {
+  local gitfile="$1" line rel dir rc=0 resolved
+  dir="$(dirname "$gitfile")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      gitdir:*)
+        rel="${line#gitdir:}"
+        rel="${rel#"${rel%%[![:space:]]*}"}"
+        rel="${rel%"${rel##*[![:space:]]}"}"
+        [[ -n "$rel" ]] || return 1
+        if [[ "$rel" == /* ]]; then
+          printf '%s\n' "$rel"
+          return 0
+        fi
+        resolved="$(realpath -m "$dir/$rel" 2>&1)" || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+          echo "NOSTAT $dir/$rel $resolved"
+          return 2
+        fi
+        printf '%s\n' "$resolved"
+        return 0
+        ;;
+    esac
+  done < "$gitfile"
+  return 1
+}
+
+# Walk components of an absolute path. Prints BLOCKED/MISSING/NOSTAT on failure.
+# Leaf is kind file if it is a file, else repo; strict prefixes are ancestor.
+walk_path_components() {
+  local target="$1" accum="" rest part kind st rc
+  rest="${target#/}"
+  while [[ -n "$rest" ]]; do
+    part="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      rest=""
+    fi
+    [[ -n "$part" ]] || continue
+    accum="$accum/$part"
+    if [[ ! -e "$accum" ]]; then
+      echo "MISSING $accum"
+      return 1
+    fi
+    rc=0
+    st="$(stat -c '%U %G %a' "$accum" 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      echo "NOSTAT $accum $st"
+      return 1
+    fi
+    if [[ "$accum" == "$target" ]]; then
+      if [[ -f "$accum" ]]; then
+        kind=file
+      else
+        kind=repo
+      fi
+    else
+      kind=ancestor
+    fi
+    case "$kind" in
+      ancestor)
+        if [[ ! -x "$accum" ]]; then
+          echo "BLOCKED $kind $accum $st"
+          return 1
+        fi
+        ;;
+      repo)
+        if [[ ! -r "$accum" || ! -x "$accum" ]]; then
+          echo "BLOCKED $kind $accum $st"
+          return 1
+        fi
+        ;;
+      file)
+        if [[ ! -r "$accum" ]]; then
+          echo "BLOCKED $kind $accum $st"
+          return 1
+        fi
+        ;;
+    esac
+  done
+  return 0
+}
+
+# Prints one of: OK | BLOCKED kind path owner group mode | MISSING path
+# | NOSTAT path err | NOTGIT no.git | NOTGIT nogitdir
+inspect_host_path() {
+  local checkout gitdir rc=0 gd_rc=0 st
+  checkout="$(abs_host_path "$1")"
+  walk_path_components "$checkout" || return 1
+  if [[ ! -e "$checkout/.git" ]]; then
+    echo "NOTGIT no.git"
+    return 1
+  fi
+  if [[ -f "$checkout/.git" ]]; then
+    if [[ ! -r "$checkout/.git" ]]; then
+      rc=0
+      st="$(stat -c '%U %G %a' "$checkout/.git" 2>&1)" || rc=$?
+      if [[ "$rc" -ne 0 ]]; then
+        echo "NOSTAT $checkout/.git $st"
+        return 1
+      fi
+      echo "BLOCKED file $checkout/.git $st"
+      return 1
+    fi
+    gitdir="$(read_gitdir_file "$checkout/.git")" || gd_rc=$?
+    if [[ "$gd_rc" -eq 2 ]]; then
+      printf '%s\n' "$gitdir"
+      return 1
+    fi
+    if [[ "$gd_rc" -ne 0 ]]; then
+      echo "NOTGIT nogitdir"
+      return 1
+    fi
+  else
+    gitdir="$checkout/.git"
+  fi
+  walk_path_components "$gitdir" || return 1
+  echo OK
+  return 0
+}
+
 # rc 0 = usable git repo on stdout; 1 = skip shortcut (message already printed).
 host_shortcut_from_path() {
-  local name="$1" p="$2" err
-  if [[ ! -e "$p" ]]; then
-    echo "fetch-deps: host shortcut $p does not exist (offline shortcut skipped)" >&2
-    return 1
-  fi
-  if [[ ! -r "$p" || ! -x "$p" ]]; then
-    report_david_host_perm "$p" "$name"
-    return 1
-  fi
-  if [[ -d "$p/.git" && ( ! -r "$p/.git" || ! -x "$p/.git" ) ]]; then
-    report_david_host_perm "$p" "$name"
-    return 1
-  fi
-  if [[ -f "$p/.git" && ! -r "$p/.git" ]]; then
-    report_david_host_perm "$p" "$name"
-    return 1
-  fi
-  if [[ ! -d "$p/.git" && ! -f "$p/.git" ]]; then
-    echo "fetch-deps: host shortcut $p exists but is not a git repo (has no .git); skipping it" >&2
-    return 1
-  fi
-  if err="$(git -c "safe.directory=$p" -C "$p" rev-parse --git-dir 2>&1)"; then
+  local name="$1" p="$2" result rc=0 err
+  p="$(abs_host_path "$p")"
+  result="$(inspect_host_path "$p")" || rc=$?
+  case "$result" in
+    OK) ;;
+    BLOCKED\ *)
+      report_owner_host_perm "$p" "$name" ""
+      return 1
+      ;;
+    MISSING\ *)
+      echo "fetch-deps: host shortcut $p does not exist (offline shortcut skipped)" >&2
+      return 1
+      ;;
+    NOSTAT\ *)
+      echo "fetch-deps: could not determine owner/group/mode (${result#NOSTAT })" >&2
+      return 1
+      ;;
+    "NOTGIT no.git")
+      echo "fetch-deps: host shortcut $p exists but is not a git repo (no .git)" >&2
+      return 1
+      ;;
+    "NOTGIT nogitdir")
+      echo "fetch-deps: host shortcut $p exists but is not a git repo ('.git' file has no gitdir: line)" >&2
+      return 1
+      ;;
+    *)
+      echo "fetch-deps: host shortcut $p inspect failed ($result)" >&2
+      return 1
+      ;;
+  esac
+  err="$(git -c "safe.directory=$p" -C "$p" rev-parse --git-dir 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
     realpath "$p"
     return 0
   fi
   if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
     echo "fetch-deps: git -C $p rev-parse --git-dir failed: $err" >&2
-    report_david_host_perm "$p" "$name"
+    report_owner_host_perm "$p" "$name" "$err"
     return 1
   fi
   echo "fetch-deps: host shortcut $p exists but is not a git repo (git: $err); skipping it" >&2
   return 1
 }
 
-report_david_host_perm() {
-  local host="$1" name="$2" who
-  who="$(id -un)"
-  echo "fetch-deps: host shortcut $host is not readable (you are $who)" >&2
+# Pure: prints suggestion commands only. groups is one space-separated argument.
+host_perm_suggestions() {
+  local path="$1" kind="$2" owner="$3" group="$4" mode="$5" agent="$6" groups="$7" setfacl_ok="$8"
+  local oct gbits has_r=0 has_x=0 need_r=0 need_x=0 in_group=0 group_ok=1 g
+  oct="$mode"
+  while [[ ${#oct} -gt 3 ]]; do
+    oct="${oct:1}"
+  done
+  while [[ ${#oct} -lt 3 ]]; do
+    oct="0$oct"
+  done
+  gbits="${oct:1:1}"
+  [[ $((gbits & 4)) -ne 0 ]] && has_r=1
+  [[ $((gbits & 1)) -ne 0 ]] && has_x=1
+  case "$kind" in
+    ancestor) need_x=1 ;;
+    repo) need_r=1; need_x=1 ;;
+    file) need_r=1 ;;
+  esac
+  for g in $groups; do
+    [[ "$g" == "$group" ]] && in_group=1
+  done
+  [[ "$need_r" -eq 1 && "$has_r" -eq 0 ]] && group_ok=0
+  [[ "$need_x" -eq 1 && "$has_x" -eq 0 ]] && group_ok=0
+
+  if [[ "$group_ok" -eq 1 && "$in_group" -eq 0 ]]; then
+    echo "sudo usermod -aG $group $agent"
+    echo "new login or \`newgrp $group\`; restart the agent session"
+  elif [[ "$group_ok" -eq 0 ]]; then
+    case "$kind" in
+      ancestor) echo "chmod g+x $path" ;;
+      repo) echo "chmod -R g+rX $path" ;;
+      file) echo "chmod g+r $path" ;;
+    esac
+    if [[ "$in_group" -eq 0 ]]; then
+      echo "sudo usermod -aG $group $agent"
+      echo "new login or \`newgrp $group\`; restart the agent session"
+    fi
+  fi
+
+  if [[ "$setfacl_ok" == "1" ]]; then
+    case "$kind" in
+      ancestor) echo "setfacl -m u:${agent}:x $path" ;;
+      repo)
+        echo "setfacl -R -m u:${agent}:rX $path"
+        echo "setfacl -R -d -m u:${agent}:rX $path"
+        ;;
+      file) echo "setfacl -m u:${agent}:r $path" ;;
+    esac
+  else
+    echo "setfacl is not installed"
+  fi
+
+  echo "broad (every user)"
+  case "$kind" in
+    ancestor) echo "chmod a+x $path" ;;
+    repo) echo "chmod -R a+rX $path" ;;
+    file) echo "chmod a+r $path" ;;
+  esac
+}
+
+report_owner_host_perm() {
+  local host="$1" name="$2" git_stderr="${3:-}"
+  local agent groups setfacl_ok=0 result rc=0 blocked=0 kind bpath owner group mode st
+  agent="$(id -un)"
+  groups="$(id -Gn)"
+  if command -v setfacl >/dev/null; then
+    setfacl_ok=1
+  fi
+  echo "fetch-deps: host shortcut $host is not readable (you are $agent)" >&2
   echo "  Host is an optional offline shortcut. A git_https or git_ssh URL will be used when set." >&2
-  echo "  David: chmod a+rX $host && chmod -R a+rX $host/.git" >&2
-  echo "  or:    setfacl -R -m u:${who}:rx $host" >&2
-  echo "  or:    chown -R dlang:dlang $host && chmod -R a+rX $host" >&2
-  echo "  then:  ./third_party/fetch-deps --git-home \"${GIT_HOME:-<GIT_HOME>}\" ro $name" >&2
+
+  result="$(inspect_host_path "$host")" || rc=$?
+  case "$result" in
+    BLOCKED\ *)
+      blocked=1
+      # BLOCKED kind path owner group mode  — path may contain spaces; kind is one token.
+      kind="${result#BLOCKED }"
+      kind="${kind%% *}"
+      st="${result#BLOCKED $kind }"
+      mode="${st##* }"
+      st="${st% $mode}"
+      group="${st##* }"
+      st="${st% $group}"
+      owner="${st##* }"
+      bpath="${st% $owner}"
+      echo "  blocking component: $bpath (kind $kind) owner=$owner group=$group mode=$mode" >&2
+      echo "  owner ($owner):" >&2
+      host_perm_suggestions "$bpath" "$kind" "$owner" "$group" "$mode" "$agent" "$groups" "$setfacl_ok" | sed 's/^/  /' >&2
+      ;;
+    NOSTAT\ *)
+      echo "  could not determine owner/group/mode (${result#NOSTAT })" >&2
+      ;;
+  esac
+
+  if [[ "$git_stderr" == *"dubious ownership"* ]]; then
+    if [[ "$blocked" -eq 0 ]]; then
+      echo "  path is readable by $agent; git reported dubious ownership; -c safe.directory=$host is already passed" >&2
+    else
+      echo "  fetch-deps already passes -c safe.directory=$host per call; do not edit global git config" >&2
+    fi
+    echo "  $git_stderr" >&2
+  fi
+  print_rerun_line
 }
 
 is_ssh_url() {
@@ -389,37 +668,96 @@ is_ssh_url() {
   [[ "$u" == git@*:* || "$u" == ssh://* ]]
 }
 
-ssh_authority_from_url() {
-  local u="$1"
-  case "$u" in
-    git@*:*) printf '%s\n' "${u%%:*}" ;;
-    ssh://*)
-      u="${u#ssh://}"
-      printf '%s\n' "${u%%/*}"
-      ;;
-  esac
+# Sets SSH_USER SSH_HOST SSH_PORT from a git ssh URL.
+parse_ssh_url() {
+  local u="$1" auth
+  SSH_USER=""
+  SSH_HOST=""
+  SSH_PORT=""
+  if [[ "$u" == ssh://* ]]; then
+    u="${u#ssh://}"
+    auth="${u%%/*}"
+    if [[ "$auth" == *@* ]]; then
+      SSH_USER="${auth%%@*}"
+      auth="${auth#*@}"
+    fi
+    if [[ "$auth" == *:* && "${auth##*:}" =~ ^[0-9]+$ ]]; then
+      SSH_PORT="${auth##*:}"
+      SSH_HOST="${auth%:*}"
+    else
+      SSH_HOST="$auth"
+    fi
+  elif [[ "$u" == *@*:* ]]; then
+    SSH_USER="${u%%@*}"
+    auth="${u#*@}"
+    SSH_HOST="${auth%%:*}"
+  fi
 }
 
-report_david_ssh() {
-  local url="$1" dest="$2" err="$3" who auth
+ssh_key_name() {
+  if [[ -n "$SSH_PORT" ]]; then
+    printf '[%s]:%s' "$SSH_HOST" "$SSH_PORT"
+  else
+    printf '%s' "$SSH_HOST"
+  fi
+}
+
+report_owner_ssh() {
+  local url="$1" dest="$2" err="$3" who keyname rc=0 out target
   who="$(id -un)"
-  auth="$(ssh_authority_from_url "$url")"
+  parse_ssh_url "$url"
   echo "fetch-deps: ssh to $url failed (you are $who)" >&2
   [[ -n "$err" ]] && echo "  $err" >&2
-  echo "  This agent cannot use your SSH keys. David can run:" >&2
-  if [[ -n "$auth" ]]; then
-    echo "  David: ssh -T $auth" >&2
+  if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+    echo "  SSH_AUTH_SOCK is unset" >&2
+  elif [[ -S "$SSH_AUTH_SOCK" ]]; then
+    echo "  SSH_AUTH_SOCK is set to $SSH_AUTH_SOCK and is a socket" >&2
+  else
+    echo "  SSH_AUTH_SOCK is set to $SSH_AUTH_SOCK but missing (e.g. hidden by sandbox tmpfs /tmp)" >&2
+  fi
+  if [[ -z "$SSH_USER" && "$url" == ssh://* ]]; then
+    echo "  ssh:// URL has no user; ssh will use $who" >&2
+  fi
+  target=""
+  if [[ -n "$SSH_USER" && -n "$SSH_HOST" ]]; then
+    target="${SSH_USER}@${SSH_HOST}"
+  elif [[ -n "$SSH_HOST" ]]; then
+    target="$SSH_HOST"
+  fi
+  if [[ -n "$target" && -n "$SSH_PORT" ]]; then
+    echo "  ssh -T -p $SSH_PORT $target" >&2
+  elif [[ -n "$target" ]]; then
+    echo "  ssh -T $target" >&2
   fi
   if [[ -n "$dest" ]]; then
-    echo "  David: git clone $url $dest" >&2
+    echo "  git clone $url $dest" >&2
   else
-    echo "  David: git clone $url" >&2
+    echo "  git clone $url" >&2
   fi
-  echo "  David: chmod 700 /home/dlang/.ssh && chmod 600 /home/dlang/.ssh/id_ed25519" >&2
-  echo "  or:    GIT_SSH_COMMAND='ssh -i /home/dlang/.ssh/id_ed25519' git clone $url ${dest:-}" >&2
+  print_rerun_line
+
+  keyname="$(ssh_key_name)"
+  if [[ "$err" == *"REMOTE HOST IDENTIFICATION HAS CHANGED"* ]]; then
+    echo "  ssh-keygen -R $keyname" >&2
+    echo "  ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts" >&2
+    echo "  host key changed, verify fingerprint before trusting" >&2
+  elif [[ "$err" == *"Host key verification failed"* || "$err" == *"host key is known"* ]]; then
+    echo "  this account (${who})'s known_hosts" >&2
+    rc=0
+    out="$(ssh-keygen -F "$keyname" 2>&1)" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      echo "  host key found in known_hosts" >&2
+    elif [[ "$rc" -eq 1 ]]; then
+      echo "  host key not found in known_hosts" >&2
+      echo "  ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts" >&2
+      echo "  verify the fingerprint first" >&2
+    else
+      echo "  ssh-keygen -F $keyname failed (exit $rc): $out" >&2
+    fi
+  fi
 }
 
-# Agents must not hang on a passphrase / host-key prompt. David can override GIT_SSH_COMMAND.
+# Agents must not hang on a passphrase / host-key prompt. Override GIT_SSH_COMMAND if needed.
 prepare_ssh_transport() {
   export GIT_TERMINAL_PROMPT=0
   if [[ -z "${GIT_SSH_COMMAND:-}" && -z "${GIT_SSH:-}" ]]; then
@@ -924,7 +1262,7 @@ remote_ls_track() {
   if [[ "$rc" -ne 0 ]]; then
     echo "fetch-deps: git ls-remote $url failed: $ls" >&2
     if is_ssh_url "$url"; then
-      report_david_ssh "$url" "$(src_path "$name")" "$ls"
+      report_owner_ssh "$url" "$(src_path "$name")" "$ls"
     fi
     return 1
   fi
@@ -1003,7 +1341,7 @@ describe_at() {
 materialize_from_host() {
   local name="$1" sha="$2" host="$3" src="$4" origin="$5" full err rc=0
   if [[ ! -r "$host" || ! -x "$host" ]]; then
-    report_david_host_perm "$host" "$name"
+    report_owner_host_perm "$host" "$name"
     return 3
   fi
   rc=0
@@ -1015,7 +1353,7 @@ materialize_from_host() {
       return 1
     fi
     if [[ "$full" == *"Permission denied"* || "$full" == *"dubious ownership"* ]]; then
-      report_david_host_perm "$host" "$name"
+      report_owner_host_perm "$host" "$name" "$full"
       return 3
     fi
     echo "fetch-deps: host $host does not have $sha; using remote if present" >&2
@@ -1036,7 +1374,7 @@ materialize_from_host() {
     if ! err="$(git -c "safe.directory=$host" -C "$src" fetch "$host" "$full" 2>&1)"; then
       echo "$err" >&2
       if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
-        report_david_host_perm "$host" "$name"
+        report_owner_host_perm "$host" "$name" "$err"
         return 3
       fi
       echo "fetch-deps: FAIL $name: fetch $full from host $host failed" >&2
@@ -1054,7 +1392,7 @@ materialize_from_host() {
   if ! err="$(git -c "safe.directory=$host" clone --no-hardlinks --no-checkout "$host" "$src" 2>&1)"; then
     echo "$err" >&2
     if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
-      report_david_host_perm "$host" "$name"
+      report_owner_host_perm "$host" "$name" "$err"
       return 3
     fi
     echo "fetch-deps: FAIL $name: clone from host $host failed" >&2
@@ -1075,7 +1413,7 @@ remote_fetch() {
   if ! err="$(git -C "$src" fetch origin "$sha" 2>&1)"; then
     echo "$err" >&2
     if is_ssh_url "$url" || [[ "$err" == *"Permission denied"* && "$err" == *"publickey"* ]]; then
-      report_david_ssh "$url" "$src" "$err"
+      report_owner_ssh "$url" "$src" "$err"
     fi
     echo "fetch-deps: FAIL $name: git fetch $url $sha failed" >&2
     return 1
@@ -1311,7 +1649,7 @@ cmd_rw() {
   host="$(local_repo_for "$name")" || rc=$?
   [[ "$rc" -eq 2 ]] && return 1
   if [[ "$rc" -eq 0 ]]; then
-    echo "    David: git -C $src push host HEAD:refs/heads/$branch"
+    echo "    owner ($(stat -c '%U' "$host")): git -C $src push host HEAD:refs/heads/$branch"
   fi
   echo "    RW: commits stay in src until pushed to the host"
   echo "    OK $name @ $(git -C "$src" rev-parse --short HEAD) branch=$branch"
@@ -1608,7 +1946,7 @@ cmd_upgrade() {
   host="$(local_repo_for "$name")" || rc=$?
   [[ "$rc" -eq 2 ]] && return 1
   if [[ "$rc" -eq 0 ]]; then
-    echo "    David: git -C $src push host HEAD:refs/heads/$branch"
+    echo "    owner ($(stat -c '%U' "$host")): git -C $src push host HEAD:refs/heads/$branch"
   fi
   lock="$(pin_path "$name")"
   backup="$(mktemp "$lock.before-upgrade.XXXXXX")"
@@ -1828,6 +2166,18 @@ cmd_outdated() {
   write_status "$name" "$mode" "$branch" "$head" "last_upstream: $tip"$'\n'"last_upstream_at: $(date -Is)"
   echo "    recorded last_upstream $tip"
 }
+
+# --- test/debug printers (no pin work) ---
+if [[ "$CMD" == "print-host-perm-suggestions" ]]; then
+  [[ ${#NAMES[@]} -eq 0 ]] || { echo "fetch-deps: --print-host-perm-suggestions takes exactly 8 arguments" >&2; exit 2; }
+  host_perm_suggestions "${PRINT_ARGS[@]}"
+  exit 0
+fi
+if [[ "$CMD" == "print-owner-host-perm" ]]; then
+  [[ ${#NAMES[@]} -eq 0 ]] || { echo "fetch-deps: --print-owner-host-perm takes exactly 3 arguments" >&2; exit 2; }
+  report_owner_host_perm "${PRINT_ARGS[@]}"
+  exit 0
+fi
 
 # --- default names ---
 if [[ "$CMD" != "status" && "$CMD" != "upgrade" && ${#NAMES[@]} -eq 0 ]]; then
