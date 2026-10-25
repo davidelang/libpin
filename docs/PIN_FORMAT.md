@@ -74,7 +74,7 @@ Declared, **loud** fallback (printed at each step). Not a silent/hidden fallback
 | `host_repo` absent, `GIT_HOME` unset or path missing | no shortcut; use remote |
 | leftover `@@…@@` token | error |
 
-An unreadable host walks the checkout path then the gitdir from the filesystem (no `git rev-parse` until that walk passes). A strict prefix needs execute only (`ancestor`); the checkout dir or gitdir directory needs read+execute (`repo`); a `.git` file needs read (`file`). Help names the first blocked component, states its owner/group/mode, and prints every applicable fix, narrowest first: group membership or group bits, then `setfacl` (or `setfacl is not installed`), then world. It never suggests `chown` or `chgrp`. The rerun line is the outer invocation (`then:`).
+An unreadable host walks the checkout path then the gitdir from the filesystem (no `git rev-parse` until that walk passes). A strict prefix needs execute only (`ancestor`); the checkout dir or gitdir directory needs read+execute (`repo`); a `.git` file needs read (`file`). Help names the first blocked component, states its owner/group/mode, and prints every applicable fix, narrowest first: group membership or group bits, then `setfacl` (or `setfacl is not installed`), then world. It never suggests `chown` or `chgrp`. The rerun line is the outer invocation (`then:`). Dubious ownership, could-not-check-access, a git read error, and a missing path each get their own first line. A path that is not a git repo keeps the not-a-repo line and gets no permission header.
 
 ```text
 fetch-deps: host shortcut <path> is not readable (you are <agent>)
