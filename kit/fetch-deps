@@ -145,10 +145,6 @@ while [[ $# -gt 0 ]]; do
         shift
         n=$((n + 1))
       done
-      if [[ $n -ne 8 ]]; then
-        echo "fetch-deps: --print-host-perm-suggestions needs 8 arguments" >&2
-        exit 2
-      fi
       ;;
     --print-owner-host-perm)
       CMD=print-owner-host-perm
@@ -160,10 +156,6 @@ while [[ $# -gt 0 ]]; do
         shift
         n=$((n + 1))
       done
-      if [[ $n -ne 3 ]]; then
-        echo "fetch-deps: --print-owner-host-perm needs 3 arguments" >&2
-        exit 2
-      fi
       ;;
     -vv) VERBOSE=2; shift ;;
     -v) VERBOSE=1; shift ;;
@@ -177,6 +169,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 while [[ $# -gt 0 ]]; do NAMES+=("$1"); shift; done
+
+if [[ "$CMD" == "print-host-perm-suggestions" ]]; then
+  M=$(( ${#PRINT_ARGS[@]} + ${#NAMES[@]} ))
+  if [[ "$M" -ne 8 ]]; then
+    echo "fetch-deps: --print-host-perm-suggestions takes exactly 8 arguments (got $M)" >&2
+    exit 2
+  fi
+fi
+if [[ "$CMD" == "print-owner-host-perm" ]]; then
+  M=$(( ${#PRINT_ARGS[@]} + ${#NAMES[@]} ))
+  if [[ "$M" -ne 3 ]]; then
+    echo "fetch-deps: --print-owner-host-perm takes exactly 3 arguments (got $M)" >&2
+    exit 2
+  fi
+fi
 
 CMD="${CMD:-ro}"
 
@@ -497,10 +504,24 @@ print_rerun_line() {
   fi
 }
 
-# Read gitdir: from a gitfile. rc 1 = no gitdir: line.
+# Split `stat -c '%U %G %a'` into owner, group, mode.
+split_stat_ugm() {
+  local _s_st="$1"
+  local -n _s_owner="$2" _s_group="$3" _s_mode="$4"
+  _s_mode="${_s_st##* }"
+  _s_st="${_s_st%"$_s_mode"}"
+  _s_st="${_s_st%"${_s_st##*[![:space:]]}"}"
+  _s_group="${_s_st##* }"
+  _s_owner="${_s_st%"$_s_group"}"
+  _s_owner="${_s_owner%"${_s_owner##*[![:space:]]}"}"
+}
+
+# Read gitdir: from a gitfile. rc 1 = no gitdir: line. rc 2 = NOSTAT via namerefs.
+# $2 = resolved gitdir nameref (success). $3/$4/$5 = status/component/error.
 read_gitdir_file() {
-  local gitfile="$1" line rel dir rc=0 resolved
-  dir="$(dirname "$gitfile")"
+  local _rg_file="$1" line rel dir rc=0 resolved
+  local -n _rg_gitdir="$2" _rg_status="$3" _rg_component="$4" _rg_error="$5"
+  dir="$(dirname "$_rg_file")"
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     case "$line" in
@@ -510,27 +531,33 @@ read_gitdir_file() {
         rel="${rel%"${rel##*[![:space:]]}"}"
         [[ -n "$rel" ]] || return 1
         if [[ "$rel" == /* ]]; then
-          printf '%s\n' "$rel"
+          _rg_gitdir="$rel"
           return 0
         fi
         resolved="$(realpath -m "$dir/$rel" 2>&1)" || rc=$?
         if [[ "$rc" -ne 0 ]]; then
-          echo "NOSTAT $dir/$rel $resolved"
+          _rg_status=NOSTAT
+          _rg_component="$dir/$rel"
+          _rg_error="$resolved"
           return 2
         fi
-        printf '%s\n' "$resolved"
+        _rg_gitdir="$resolved"
         return 0
         ;;
     esac
-  done < "$gitfile"
+  done < "$_rg_file"
   return 1
 }
 
-# Walk components of an absolute path. Prints BLOCKED/MISSING/NOSTAT on failure.
+# Walk components of an absolute path. Failure fills namerefs and returns 1.
 # Leaf is kind file if it is a file, else repo; strict prefixes are ancestor.
+# $2..$8 = status, component, error, kind, owner, group, mode.
 walk_path_components() {
-  local target="$1" accum="" rest part kind st rc
-  rest="${target#/}"
+  local _walk_target="$1" accum="" rest part kind st rc
+  local _walk_own_n="$6" _walk_grp_n="$7" _walk_mode_n="$8"
+  local -n _walk_status="$2" _walk_component="$3" _walk_error="$4"
+  local -n _walk_kind="$5" _walk_owner="$6" _walk_group="$7" _walk_mode="$8"
+  rest="${_walk_target#/}"
   while [[ -n "$rest" ]]; do
     part="${rest%%/*}"
     if [[ "$rest" == */* ]]; then
@@ -541,16 +568,20 @@ walk_path_components() {
     [[ -n "$part" ]] || continue
     accum="$accum/$part"
     if [[ ! -e "$accum" ]]; then
-      echo "MISSING $accum"
+      _walk_status=MISSING
+      _walk_component="$accum"
+      _walk_error=
       return 1
     fi
     rc=0
     st="$(stat -c '%U %G %a' "$accum" 2>&1)" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-      echo "NOSTAT $accum $st"
+      _walk_status=NOSTAT
+      _walk_component="$accum"
+      _walk_error="$st"
       return 1
     fi
-    if [[ "$accum" == "$target" ]]; then
+    if [[ "$accum" == "$_walk_target" ]]; then
       if [[ -f "$accum" ]]; then
         kind=file
       else
@@ -562,19 +593,31 @@ walk_path_components() {
     case "$kind" in
       ancestor)
         if [[ ! -x "$accum" ]]; then
-          echo "BLOCKED $kind $accum $st"
+          _walk_status=BLOCKED
+          _walk_component="$accum"
+          _walk_error=
+          _walk_kind=$kind
+          split_stat_ugm "$st" "$_walk_own_n" "$_walk_grp_n" "$_walk_mode_n"
           return 1
         fi
         ;;
       repo)
         if [[ ! -r "$accum" || ! -x "$accum" ]]; then
-          echo "BLOCKED $kind $accum $st"
+          _walk_status=BLOCKED
+          _walk_component="$accum"
+          _walk_error=
+          _walk_kind=$kind
+          split_stat_ugm "$st" "$_walk_own_n" "$_walk_grp_n" "$_walk_mode_n"
           return 1
         fi
         ;;
       file)
         if [[ ! -r "$accum" ]]; then
-          echo "BLOCKED $kind $accum $st"
+          _walk_status=BLOCKED
+          _walk_component="$accum"
+          _walk_error=
+          _walk_kind=$kind
+          split_stat_ugm "$st" "$_walk_own_n" "$_walk_grp_n" "$_walk_mode_n"
           return 1
         fi
         ;;
@@ -583,14 +626,28 @@ walk_path_components() {
   return 0
 }
 
-# Prints one of: OK | BLOCKED kind path owner group mode | MISSING path
-# | NOSTAT path err | NOTGIT no.git | NOTGIT nogitdir
+# $2..$8 = status, component, error, kind, owner, group, mode.
 inspect_host_path() {
-  local checkout gitdir rc=0 gd_rc=0 st
-  checkout="$(abs_host_path "$1")"
-  walk_path_components "$checkout" || return 1
+  local _ih_path="$1"
+  local -n _ih_status="$2" _ih_component="$3" _ih_error="$4"
+  local -n _ih_kind="$5" _ih_owner="$6" _ih_group="$7" _ih_mode="$8"
+  local _ih_st_n="$2" _ih_comp_n="$3" _ih_err_n="$4"
+  local _ih_kind_n="$5" _ih_own_n="$6" _ih_grp_n="$7" _ih_mode_n="$8"
+  local checkout _ih_gitdir rc=0 gd_rc=0 st
+  _ih_status=OK
+  _ih_component=
+  _ih_error=
+  _ih_kind=
+  _ih_owner=
+  _ih_group=
+  _ih_mode=
+  checkout="$(abs_host_path "$_ih_path")"
+  walk_path_components "$checkout" "$_ih_st_n" "$_ih_comp_n" "$_ih_err_n" \
+    "$_ih_kind_n" "$_ih_own_n" "$_ih_grp_n" "$_ih_mode_n" || return 1
   if [[ ! -e "$checkout/.git" ]]; then
-    echo "NOTGIT no.git"
+    _ih_status=NOTGIT
+    _ih_component="$checkout"
+    _ih_error=no.git
     return 1
   fi
   if [[ -f "$checkout/.git" ]]; then
@@ -598,68 +655,55 @@ inspect_host_path() {
       rc=0
       st="$(stat -c '%U %G %a' "$checkout/.git" 2>&1)" || rc=$?
       if [[ "$rc" -ne 0 ]]; then
-        echo "NOSTAT $checkout/.git $st"
+        _ih_status=NOSTAT
+        _ih_component="$checkout/.git"
+        _ih_error="$st"
         return 1
       fi
-      echo "BLOCKED file $checkout/.git $st"
+      _ih_status=BLOCKED
+      _ih_kind=file
+      _ih_component="$checkout/.git"
+      _ih_error=
+      split_stat_ugm "$st" "$_ih_own_n" "$_ih_grp_n" "$_ih_mode_n"
       return 1
     fi
-    gitdir="$(read_gitdir_file "$checkout/.git")" || gd_rc=$?
+    read_gitdir_file "$checkout/.git" _ih_gitdir "$_ih_st_n" "$_ih_comp_n" "$_ih_err_n" || gd_rc=$?
     if [[ "$gd_rc" -eq 2 ]]; then
-      printf '%s\n' "$gitdir"
       return 1
     fi
     if [[ "$gd_rc" -ne 0 ]]; then
-      echo "NOTGIT nogitdir"
+      _ih_status=NOTGIT
+      _ih_component="$checkout/.git"
+      _ih_error=nogitdir
       return 1
     fi
   else
-    gitdir="$checkout/.git"
+    _ih_gitdir="$checkout/.git"
   fi
-  walk_path_components "$gitdir" || return 1
-  echo OK
+  walk_path_components "$_ih_gitdir" "$_ih_st_n" "$_ih_comp_n" "$_ih_err_n" \
+    "$_ih_kind_n" "$_ih_own_n" "$_ih_grp_n" "$_ih_mode_n" || return 1
+  _ih_status=OK
   return 0
 }
 
 # rc 0 = usable git repo on stdout; 1 = skip shortcut (message already printed).
 host_shortcut_from_path() {
-  local name="$1" p="$2" result rc=0 err
+  local name="$1" p="$2" rc=0 err
+  local hs_status="" hs_component="" hs_error="" hs_kind="" hs_owner="" hs_group="" hs_mode=""
   p="$(abs_host_path "$p")"
-  result="$(inspect_host_path "$p")" || rc=$?
-  case "$result" in
-    OK) ;;
-    BLOCKED\ *)
-      report_owner_host_perm "$p" "$name" ""
-      return 1
-      ;;
-    MISSING\ *)
-      echo "fetch-deps: host shortcut $p does not exist (offline shortcut skipped)" >&2
-      return 1
-      ;;
-    NOSTAT\ *)
-      echo "fetch-deps: could not determine owner/group/mode (${result#NOSTAT })" >&2
-      return 1
-      ;;
-    "NOTGIT no.git")
-      echo "fetch-deps: host shortcut $p exists but is not a git repo (no .git)" >&2
-      return 1
-      ;;
-    "NOTGIT nogitdir")
-      echo "fetch-deps: host shortcut $p exists but is not a git repo ('.git' file has no gitdir: line)" >&2
-      return 1
-      ;;
-    *)
-      echo "fetch-deps: host shortcut $p inspect failed ($result)" >&2
-      return 1
-      ;;
-  esac
+  inspect_host_path "$p" hs_status hs_component hs_error hs_kind hs_owner hs_group hs_mode || rc=$?
+  if [[ "$hs_status" != "OK" ]]; then
+    report_owner_host_perm "$p" "$name" ""
+    return 1
+  fi
+  rc=0
   err="$(git -c "safe.directory=$p" -C "$p" rev-parse --git-dir 2>&1)" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     realpath "$p"
     return 0
   fi
   if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
-    echo "fetch-deps: git -C $p rev-parse --git-dir failed: $err" >&2
+    echo "fetch-deps: git -C $p rev-parse --git-dir failed" >&2
     report_owner_host_perm "$p" "$name" "$err"
     return 1
   fi
@@ -728,46 +772,100 @@ host_perm_suggestions() {
   esac
 }
 
+# Print how to inspect a component whose owner/group/mode could not be determined.
+# Commands are text; they are never run. Does not print the rerun line.
+report_nostat_how() {
+  local _ns_comp="$1" _ns_err="$2" rest part accum chain
+  echo "  component: $_ns_comp" >&2
+  echo "  $_ns_err" >&2
+  if command -v namei >/dev/null; then
+    echo "  namei -l $_ns_comp" >&2
+    return
+  fi
+  echo "  namei is not installed" >&2
+  chain="/"
+  rest="${_ns_comp#/}"
+  accum=""
+  while [[ -n "$rest" ]]; do
+    part="${rest%%/*}"
+    if [[ "$rest" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      rest=""
+    fi
+    [[ -n "$part" ]] || continue
+    accum="$accum/$part"
+    chain="$chain $accum"
+  done
+  echo "  ls -ld $chain" >&2
+}
+
 report_owner_host_perm() {
   local host="$1" name="$2" git_stderr="${3:-}"
-  local agent groups setfacl_ok=0 result rc=0 blocked=0 kind bpath owner group mode st
+  local agent groups setfacl_ok=0 rc=0
+  local rp_status="" rp_component="" rp_error="" rp_kind="" rp_owner="" rp_group="" rp_mode=""
   agent="$(id -un)"
   groups="$(id -Gn)"
   if command -v setfacl >/dev/null; then
     setfacl_ok=1
   fi
-  echo "fetch-deps: host shortcut $host is not readable (you are $agent)" >&2
-  echo "  Host is an optional offline shortcut. A git_https or git_ssh URL will be used when set." >&2
+  inspect_host_path "$host" rp_status rp_component rp_error rp_kind rp_owner rp_group rp_mode || rc=$?
 
-  result="$(inspect_host_path "$host")" || rc=$?
-  case "$result" in
-    BLOCKED\ *)
-      blocked=1
-      # BLOCKED kind path owner group mode  — path may contain spaces; kind is one token.
-      kind="${result#BLOCKED }"
-      kind="${kind%% *}"
-      st="${result#BLOCKED $kind }"
-      mode="${st##* }"
-      st="${st% $mode}"
-      group="${st##* }"
-      st="${st% $group}"
-      owner="${st##* }"
-      bpath="${st% $owner}"
-      echo "  blocking component: $bpath (kind $kind) owner=$owner group=$group mode=$mode" >&2
-      echo "  owner ($owner):" >&2
-      host_perm_suggestions "$bpath" "$kind" "$owner" "$group" "$mode" "$agent" "$groups" "$setfacl_ok" | sed 's/^/  /' >&2
+  case "$rp_status" in
+    BLOCKED)
+      echo "fetch-deps: host shortcut $host is not readable (you are $agent)" >&2
       ;;
-    NOSTAT\ *)
-      echo "  could not determine owner/group/mode (${result#NOSTAT })" >&2
+    NOSTAT)
+      echo "fetch-deps: host shortcut $host: could not check access (you are $agent); offline shortcut skipped" >&2
+      ;;
+    MISSING)
+      echo "fetch-deps: host shortcut $host does not exist (you are $agent)" >&2
+      ;;
+    NOTGIT)
+      if [[ "$rp_error" == "nogitdir" ]]; then
+        echo "fetch-deps: host shortcut $host exists but is not a git repo ('.git' file has no gitdir: line)" >&2
+      else
+        echo "fetch-deps: host shortcut $host exists but is not a git repo (no .git)" >&2
+      fi
+      ;;
+    OK)
+      if [[ "$git_stderr" == *"dubious ownership"* ]]; then
+        echo "fetch-deps: host shortcut $host is readable but git refused it (dubious ownership) (you are $agent)" >&2
+      elif [[ -n "$git_stderr" ]]; then
+        echo "fetch-deps: host shortcut $host: git could not read it (you are $agent)" >&2
+      else
+        echo "fetch-deps: host shortcut $host is readable (you are $agent)" >&2
+      fi
+      ;;
+    *)
+      echo "fetch-deps: host shortcut $host inspect failed ($rp_status)" >&2
       ;;
   esac
 
-  if [[ "$git_stderr" == *"dubious ownership"* ]]; then
-    if [[ "$blocked" -eq 0 ]]; then
-      echo "  path is readable by $agent; git reported dubious ownership; -c safe.directory=$host is already passed" >&2
-    else
-      echo "  fetch-deps already passes -c safe.directory=$host per call; do not edit global git config" >&2
-    fi
+  if [[ "$rp_status" != "NOTGIT" ]]; then
+    echo "  Host is an optional offline shortcut. A git_https or git_ssh URL will be used when set." >&2
+  fi
+
+  case "$rp_status" in
+    BLOCKED)
+      echo "  blocking component: $rp_component (kind $rp_kind) owner=$rp_owner group=$rp_group mode=$rp_mode" >&2
+      echo "  owner ($rp_owner):" >&2
+      host_perm_suggestions "$rp_component" "$rp_kind" "$rp_owner" "$rp_group" "$rp_mode" "$agent" "$groups" "$setfacl_ok" | sed 's/^/  /' >&2
+      if [[ "$git_stderr" == *"dubious ownership"* ]]; then
+        echo "  fetch-deps already passes -c safe.directory=$host per call; do not edit global git config" >&2
+      fi
+      ;;
+    NOSTAT)
+      report_nostat_how "$rp_component" "$rp_error"
+      ;;
+    OK)
+      if [[ "$git_stderr" == *"dubious ownership"* ]]; then
+        echo "  path is readable by $agent; git reported dubious ownership; -c safe.directory=$host is already passed" >&2
+      fi
+      ;;
+  esac
+
+  if [[ -n "$git_stderr" ]]; then
     echo "  $git_stderr" >&2
   fi
   print_rerun_line
@@ -1457,15 +1555,17 @@ materialize_from_host() {
   rc=0
   full="$(git_host "$host" rev-parse --verify "${sha}^{commit}" 2>&1)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    echo "fetch-deps: cannot resolve '$sha' in host $host: $full" >&2
     if [[ "$full" == *"ambiguous"* ]]; then
+      echo "fetch-deps: cannot resolve '$sha' in host $host: $full" >&2
       echo "fetch-deps: sha '$sha' is ambiguous in $host" >&2
       return 1
     fi
     if [[ "$full" == *"Permission denied"* || "$full" == *"dubious ownership"* ]]; then
+      echo "fetch-deps: cannot resolve '$sha' in host $host" >&2
       report_owner_host_perm "$host" "$name" "$full"
       return 3
     fi
+    echo "fetch-deps: cannot resolve '$sha' in host $host: $full" >&2
     echo "fetch-deps: host $host does not have $sha; using remote if present" >&2
     return 3
   fi
@@ -1482,11 +1582,11 @@ materialize_from_host() {
     fi
     echo "    fetch $full from host into existing src"
     if ! err="$(git -c "safe.directory=$host" -C "$src" fetch "$host" "$full" 2>&1)"; then
-      echo "$err" >&2
       if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
         report_owner_host_perm "$host" "$name" "$err"
         return 3
       fi
+      echo "$err" >&2
       echo "fetch-deps: FAIL $name: fetch $full from host $host failed" >&2
       return 1
     fi
@@ -1500,11 +1600,11 @@ materialize_from_host() {
   fi
   echo "    clone --no-hardlinks --no-checkout $host → $src"
   if ! err="$(git -c "safe.directory=$host" clone --no-hardlinks --no-checkout "$host" "$src" 2>&1)"; then
-    echo "$err" >&2
     if [[ "$err" == *"Permission denied"* || "$err" == *"dubious ownership"* ]]; then
       report_owner_host_perm "$host" "$name" "$err"
       return 3
     fi
+    echo "$err" >&2
     echo "fetch-deps: FAIL $name: clone from host $host failed" >&2
     return 1
   fi
@@ -2279,12 +2379,10 @@ cmd_outdated() {
 
 # --- test/debug printers (no pin work) ---
 if [[ "$CMD" == "print-host-perm-suggestions" ]]; then
-  [[ ${#NAMES[@]} -eq 0 ]] || { echo "fetch-deps: --print-host-perm-suggestions takes exactly 8 arguments" >&2; exit 2; }
   host_perm_suggestions "${PRINT_ARGS[@]}"
   exit 0
 fi
 if [[ "$CMD" == "print-owner-host-perm" ]]; then
-  [[ ${#NAMES[@]} -eq 0 ]] || { echo "fetch-deps: --print-owner-host-perm takes exactly 3 arguments" >&2; exit 2; }
   report_owner_host_perm "${PRINT_ARGS[@]}"
   exit 0
 fi
