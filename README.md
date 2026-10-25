@@ -1,6 +1,6 @@
 # libpin
 
-**Pin, materialize, build, and collect artifacts** for third-party libraries — with Linux write confinement (bubblewrap + Landlock). Missing sandbox tools is an error unless you pass `--no-bwrap --no-landlock`.
+**Pin, materialize, build, and collect artifacts** for third-party libraries — with Linux write confinement (bubblewrap + Landlock) used when available.
 
 libpin is a small toolkit you drop in as your project’s `third_party/` (or copy next to pins). It was battle-tested inside [VehicleExpenses](https://github.com/) against multi-hour Docker/NDK builds (OpenCV, rclone, Paddle-Lite, co-developed Kotlin libraries) and non-git file pins (model packs with mandatory `sha256`).
 
@@ -71,9 +71,9 @@ Tools assume they live **in** the directory that contains pins (classically name
 | bash, python3 ≥ 3.11 (`tomllib` only) | Core |
 | git | Git pins |
 | curl | HTTPS `[[source]]` |
-| **bubblewrap** (`bwrap`) | Required unless `--no-bwrap --no-landlock`; `apt install bubblewrap` |
-| **Landlock** (kernel LSM) | Required unless `--no-bwrap --no-landlock`; `./libpin-landlock --status` |
-| Linux | Missing sandbox tools is an error on every OS; pass both `--no-*` flags |
+| **bubblewrap** (`bwrap`) | Optional; used when available. `apt install bubblewrap`. `--require-bwrap` stops if it is missing |
+| **Landlock** (kernel LSM) | Optional; used when available. `./libpin-landlock --status`. `--require-landlock` / `--require-libpin` stop if it is missing |
+| Linux | On other OS both tools are unavailable, reported, and the run continues |
 
 ## License
 

@@ -120,8 +120,11 @@ Options (common):
   --base REF           rw base (default: pin git_sha)
   --ref REF            upgrade source ref
   --record             build: write new [[artifact]] sha256 values into libpin.toml
-  --no-bwrap           Disable bubblewrap (required together with --no-landlock if tools are missing)
-  --no-landlock        Disable Landlock
+  --no-bwrap           Disable bubblewrap (or LIBPIN_NO_BWRAP=1)
+  --no-landlock        Disable Landlock (or LIBPIN_NO_LANDLOCK=1)
+  --require-bwrap      Stop if bubblewrap is not available
+  --require-landlock   Stop if Landlock is not available
+  --require-libpin     Same as --require-landlock
 ```
 
 ```text
@@ -131,7 +134,7 @@ Options (common):
   --no-bwrap / --no-landlock
 ```
 
-Pins with `default = false` are omitted from the default NAME set of both tools. Missing bwrap or Landlock is an error unless both `--no-bwrap` and `--no-landlock` are passed.
+Pins with `default = false` are omitted from the default NAME set of both tools. bwrap and Landlock are used when available; `--no-bwrap` / `--no-landlock` turn one off; `--require-bwrap` / `--require-landlock` stop if that tool is missing.
 
 ---
 
@@ -186,7 +189,7 @@ sha256 = "…"
 - `git add` a full non-submodule dump of library sources into the app repo.
 - Use SSH for `[[source]]` URLs (never; use HTTPS / file / seed). Git pins may set `git_ssh`; fetch-deps prefers `git_https`, then `git_ssh`.
 - Expect bit-identical SO files when `reproducible = false` (process still must be documented).
-- Skip a missing sandbox: pass both `--no-bwrap` and `--no-landlock`, or install the tools.
+- Pass `--no-bwrap` / `--no-landlock` just because a tool is missing (the run already continues after a loud report). Use `--require-bwrap` / `--require-landlock` when the run must have that protection.
 - Skip a remote URL when the host shortcut is missing or unreadable (host is optional).
 
 ---

@@ -11,8 +11,8 @@ bash --version
 git --version
 curl --version
 
-# Sandbox (Linux). Missing tools is an error unless you pass
-# --no-bwrap --no-landlock
+# Sandbox (Linux): used when available. --require-bwrap / --require-landlock
+# stop if that tool is missing.
 sudo apt install bubblewrap    # provides `bwrap`
 # Landlock is a kernel feature; check:
 ./kit/libpin-landlock --status
@@ -51,7 +51,6 @@ third_party/                 ← kit/ dropped here (or use kit/ in place)
 cd kit    # or: cd your-repo/third_party
 
 # Materialize (creates tiny git tree in example/src from seed-src; applies patch)
-# Add --no-bwrap --no-landlock if sandbox tools are missing.
 ./fetch-deps ro example
 
 # Build + collect → example/artifact/hello.bin
@@ -140,7 +139,7 @@ Add `mylib/build` (executable) that writes products under `src/…`, then:
 ./get-artifacts [NAME…]       # collect only (iterate builds)
 ```
 
-Disable sandbox when debugging (both flags required):
+Turn sandbox tools off on purpose:
 
 ```bash
 LIBPIN_NO_BWRAP=1 LIBPIN_NO_LANDLOCK=1 ./fetch-deps build example

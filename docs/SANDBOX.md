@@ -7,11 +7,10 @@
 - bubblewrap (`bwrap`) and Landlock are **protections**, not requirements. They stop a pin's materialize and build from writing to the rest of the system; libpin works without them.
 - Each one is **used when it is installed and works** on this system. "Works" is checked, not assumed: an installed `bwrap` can still be blocked (for example, unprivileged user namespaces restricted for that account).
 - When one is missing or unusable, libpin **reports it loudly, with the reason, and continues** without it. When neither is active it says that pin writes are not confined.
-- libpin **never refuses to run** because one is missing, and **never drops one silently**.
+- libpin **never refuses to run** because one is missing (unless `--require-bwrap` / `--require-landlock` was given), and **never drops one silently**.
 - `--no-bwrap` / `--no-landlock` (or `LIBPIN_NO_BWRAP=1` / `LIBPIN_NO_LANDLOCK=1`) are deliberate off switches, reported as "disabled"; nobody needs them just because a tool is missing.
+- `--require-bwrap` / `--require-landlock` (`--require-libpin` is the same as `--require-landlock`) force that protection: the run stops if it is not available. They conflict with the matching `--no-*` flag (exit 2).
 - Availability is decided once per run by the entry point (`fetch-deps`, or `libpin-sandbox` when run directly). The low-level helpers `libpin-bwrap` and `libpin-landlock` run only after that decision, so a failure inside them (for example, a Landlock ruleset that will not apply after `--status` said available) is a real fault and stops the run.
-
-**Implementation status (remove when done):** as of 2026-10-24 the kit still exits when `bwrap` or Landlock is missing, and parts of this document and the other docs still describe that. They are being brought in line with this policy.
 
 This document covers capabilities, composition, modes, environment variables, and limits.
 
@@ -124,7 +123,7 @@ command -v bwrap
 bwrap --version
 ```
 
-If `bwrap` is missing, `libpin-bwrap` **exits 1** with `pass --no-bwrap --no-landlock to run unsandboxed`. `LIBPIN_NO_BWRAP=1` skips this helper (exec bare) — fetch-deps still requires `--no-landlock` as well unless landlock is also disabled.
+Entry points (`fetch-deps`, `libpin-sandbox`) probe `bwrap --ro-bind / / true`. If bwrap is missing or that probe fails, they report it and continue without bwrap. `libpin-bwrap` itself is only reached after that decision; a missing `bwrap` there **exits 1** (`libpin-bwrap: bwrap not found`). `LIBPIN_NO_BWRAP=1` or `--no-bwrap` skips bwrap on purpose. `--require-bwrap` stops if bwrap is not available.
 
 ### What it does
 
@@ -222,7 +221,7 @@ Builds need temp files and `> /dev/null`; the bound remains “not the app tree 
 
 ### Unavailable / apply failure
 
-If Landlock is unavailable or applying the ruleset fails, `libpin-landlock` **exits 1** with `pass --no-bwrap --no-landlock to run unsandboxed`. It does not exec the command bare.
+If Landlock is unavailable (`libpin-landlock --status` non-zero), the entry point reports it and continues without Landlock. Applying the ruleset after `--status` said available is a real fault: `libpin-landlock` **exits 1** with `failed to apply landlock: <err>` and does not exec the command bare. `--require-landlock` / `--require-libpin` stop if Landlock is not available.
 
 ### Disable
 
@@ -238,7 +237,7 @@ LIBPIN_NO_LANDLOCK=1
 | Confidentiality | Reads are unrestricted — secrets on the host remain readable |
 | Network / IPC | Not covered by this helper |
 | ABI / arch | Syscall numbers wired for x86_64 and aarch64 (common modern NRs 444–446) |
-| Kernel age | Needs Landlock-capable kernel; older kernels → error unless `--no-landlock` |
+| Kernel age | Needs Landlock-capable kernel; older kernels → Landlock off, reported, run continues |
 | Composition | Stacks under bwrap; can also run Landlock-only if bwrap is disabled |
 | `get-artifacts` | Off (destinations may be `app/…`) |
 
@@ -248,8 +247,8 @@ LIBPIN_NO_LANDLOCK=1
 
 | Variable | Effect |
 |----------|--------|
-| `LIBPIN_NO_BWRAP=1` | Skip bubblewrap |
-| `LIBPIN_NO_LANDLOCK=1` | Skip Landlock |
+| `LIBPIN_NO_BWRAP=1` | Skip bubblewrap (deliberate; same as `--no-bwrap`) |
+| `LIBPIN_NO_LANDLOCK=1` | Skip Landlock (deliberate; same as `--no-landlock`) |
 | `LIBPIN_SANDBOX=<mode>` | Informational (set by bwrap). **Does not skip** sandboxing |
 | `LIBPIN_INSIDE=1` | Set by fetch-deps on re-entry; fetch-deps then passes `--no-bwrap` so bwrap does not nest; Landlock may still stack |
 | `LIBPIN_LANDLOCK=1` | Set by landlock after successful restrict |
@@ -286,13 +285,20 @@ bwrap alone:
 LIBPIN_NO_LANDLOCK=1 ./libpin-sandbox --mode lib --lib example -- touch example/status.local
 ```
 
-Fully unsandboxed:
+Both tools off (deliberate):
 
 ```bash
 # fetch-deps / get-artifacts:
 ./fetch-deps --no-bwrap --no-landlock ro example
-# helpers (env only; libpin-sandbox does not take those flags):
+# helpers (env, or libpin-sandbox --require-* to force a tool):
 LIBPIN_NO_BWRAP=1 LIBPIN_NO_LANDLOCK=1 ./libpin-sandbox --mode lib --lib example -- true
+```
+
+Force a tool (stop if it is missing):
+
+```bash
+./fetch-deps --require-bwrap --require-landlock ro example
+./fetch-deps --require-libpin ro example   # same as --require-landlock
 ```
 
 ---
@@ -321,4 +327,4 @@ For untrusted CI of adversarial source trees, combine with stronger isolation (c
 
 ## Non-Linux
 
-Missing bwrap or Landlock is an error with the same unsandboxed hint. Pass `--no-bwrap --no-landlock` on those hosts. Pin materialize and build remain the source of truth for correctness.
+bwrap and Landlock are used when they work. On a host without them the entry point reports each as unavailable and continues; pin writes are not confined. `--require-bwrap` / `--require-landlock` stop if that tool is missing. Pin materialize and build remain the source of truth for correctness.

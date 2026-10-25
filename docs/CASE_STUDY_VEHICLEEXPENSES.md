@@ -93,7 +93,7 @@ Artifact rows include both:
 
 ### Build confinement
 
-Materialize and `./build` run under `libpin-sandbox` (pass `--no-bwrap --no-landlock` only when the tools are missing):
+Materialize and `./build` run under `libpin-sandbox` (bwrap and Landlock used when available):
 
 - materialize → mode `lib` (write under `third_party/paddle/`)
 - build → mode `src` (mutation under `third_party/paddle/src/`)
@@ -146,7 +146,7 @@ libpin itself does not mandate QEMU; the case study shows how **artifact collect
 2. **`libpin.toml` is the contract** — mode is `status.local`, not the pin file.
 3. **Non-git sources need the same discipline as git** — content hash is the pin; fail closed.
 4. **Independent `[[artifact]]` rows** — pin-local audit vs app promote without a second tool.
-5. **Sandbox is required unless both `--no-bwrap` and `--no-landlock` are passed** — mutation surfaces are explicit; host clones stay read-only.
+5. **Sandbox is optional protection** — mutation surfaces are explicit; host clones stay read-only. `--require-bwrap` / `--require-landlock` stop if that tool is missing.
 6. **Document ABI product policy in SOURCE.md** — e.g. “true v7 has no product soft-fp16”; tailor is the size lever.
 7. **Nested consumers copy the kit** until libpin is a published dependency.
 
