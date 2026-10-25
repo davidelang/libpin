@@ -25,7 +25,7 @@ libpin standardizes:
 1. **One layout** for every dependency (git or file sources).
 2. **One pin file** (`libpin.toml`) — identity, build steps, artifact collection.
 3. **Write confinement** so materialize/build may only **mutate** a declared surface (read/exec stay free so toolchains work). Host clones under `GIT_HOME` are read-only.
-4. **Explicit unsandboxed mode** — missing `bwrap` or Landlock is an error; pass `--no-bwrap --no-landlock` to run without the sandbox.
+4. **Sandbox is optional protection** — `bwrap` and Landlock are used when available, reported loudly when not, and the run continues. See the [sandbox policy](docs/SANDBOX.md#policy-sandboxing-is-optional-protection).
 
 ## 30-second try
 

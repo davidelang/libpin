@@ -1,12 +1,17 @@
 # libpin sandbox: bubblewrap + Landlock
 
-**Write confinement** for pin materialize and build on Linux. Missing `bwrap` or Landlock is an **error** everywhere (Linux, non-Linux, CI):
+**Write confinement** for pin materialize and build on Linux, used when the system provides it.
 
-```text
-pass --no-bwrap --no-landlock to run unsandboxed
-```
+## Policy: sandboxing is optional protection
 
-There is no platform auto-detection and no “soft-fail to bare exec.” `--no-bwrap --no-landlock` (or both `LIBPIN_NO_BWRAP=1` and `LIBPIN_NO_LANDLOCK=1`) skip the write probe and the sandbox.
+- bubblewrap (`bwrap`) and Landlock are **protections**, not requirements. They stop a pin's materialize and build from writing to the rest of the system; libpin works without them.
+- Each one is **used when it is installed and works** on this system. "Works" is checked, not assumed: an installed `bwrap` can still be blocked (for example, unprivileged user namespaces restricted for that account).
+- When one is missing or unusable, libpin **reports it loudly, with the reason, and continues** without it. When neither is active it says that pin writes are not confined.
+- libpin **never refuses to run** because one is missing, and **never drops one silently**.
+- `--no-bwrap` / `--no-landlock` (or `LIBPIN_NO_BWRAP=1` / `LIBPIN_NO_LANDLOCK=1`) are deliberate off switches, reported as "disabled"; nobody needs them just because a tool is missing.
+- Availability is decided once per run by the entry point (`fetch-deps`, or `libpin-sandbox` when run directly). The low-level helpers `libpin-bwrap` and `libpin-landlock` run only after that decision, so a failure inside them (for example, a Landlock ruleset that will not apply after `--status` said available) is a real fault and stops the run.
+
+**Implementation status (remove when done):** as of 2026-10-24 the kit still exits when `bwrap` or Landlock is missing, and parts of this document and the other docs still describe that. They are being brought in line with this policy.
 
 This document covers capabilities, composition, modes, environment variables, and limits.
 
@@ -16,7 +21,7 @@ This document covers capabilities, composition, modes, environment variables, an
 
 1. **Harden execution of retrieved trees** — especially untrusted or large third-party sources — so a buggy/malicious build cannot casually rewrite the rest of the app tree or a host clone under `GIT_HOME`.
 2. **Keep toolchains working** — JDKs, SDKs, compilers, Docker clients must still **read and execute** host tools and libraries.
-3. **Explicit unsandboxed mode** — operators who lack the tools pass both `--no-bwrap` and `--no-landlock`.
+3. **Optional, never silent** — see [Policy](#policy-sandboxing-is-optional-protection): used when available, reported when not, the run continues.
 4. **Single-level outer jail** — nested bubblewrap user namespaces fail; Landlock **stacks**. Nesting is detected with a write probe, not by reading `LIBPIN_SANDBOX`.
 
 Primary threat model for Landlock in libpin: **mutation** (write/create/remove/truncate/refer) outside the allowed surface. It is **not** a full confidentiality sandbox (reads stay open by design).
