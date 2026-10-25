@@ -3,11 +3,48 @@
 set -uo pipefail
 KIT="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d /tmp/libpin-test.XXXXXX)"
-trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+SAMPLE=/tmp/libpin-help-samples
+rm -rf "$SAMPLE"; mkdir -p "$SAMPLE"
+fix_tree_perms() {
+  local d="${1:-}" f
+  [[ -n "$d" && -e "$d" ]] || return 0
+  [[ -L "$d" ]] && return 0
+  chmod u+rwx "$d" || return 0
+  [[ -d "$d" ]] || return 0
+  for f in "$d"/.* "$d"/*; do
+    [[ "$f" == "$d/." || "$f" == "$d/.." ]] && continue
+    [[ -e "$f" || -L "$f" ]] || continue
+    fix_tree_perms "$f"
+  done
+}
+trap 'fix_tree_perms "$T"; rm -rf "$T"' EXIT
 pass=0 fail=0
 ok()  { pass=$((pass+1)); echo "ok   $*"; }
 bad() { fail=$((fail+1)); echo "FAIL $*"; }
 G() { git -c user.name=t -c user.email=t@t "$@"; }
+AGENT=$(id -un)
+save_sample() { cp "$T/out" "$SAMPLE/$1.txt"; }
+restore_comp() {
+  chmod u+rwx "$1"
+  if [[ -d "$1" ]]; then
+    chmod -R u+rwx "$1"
+  fi
+}
+no_own() { ! grep -q chown "$T/out" && ! grep -q chgrp "$T/out"; }
+psugg() { "$KIT/fetch-deps" --no-bwrap --no-landlock --print-host-perm-suggestions "$@" >"$T/out" 2>&1; }
+powner() { "$KIT/fetch-deps" --no-bwrap --no-landlock --print-owner-host-perm "$@" >"$T/out" 2>&1; }
+order_ok() {
+  python3 - "$T/out" "$@" <<'PY'
+import sys
+text = open(sys.argv[1]).read()
+pos = -1
+for n in sys.argv[2:]:
+    i = text.find(n)
+    if i < 0 or i < pos:
+        sys.exit(1)
+    pos = i
+PY
+}
 
 GH="$T/gh"; mkdir -p "$GH/toy"
 G -C "$GH/toy" init -q -b master
@@ -165,7 +202,7 @@ sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
 sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
 (cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock --git-home "$T/gh-notgit" ro toy) >"$T/out" 2>&1; rc=$?
-[[ $rc -eq 0 ]] && grep -q 'skipping it' "$T/out" && [[ -f "$R/third_party/toy/src/content" ]] && ok "non-git shortcut falls through to git_https" || bad "notgit+https rc=$rc $(tailout)"
+[[ $rc -eq 0 ]] && grep -q '(no .git)' "$T/out" && [[ -f "$R/third_party/toy/src/content" ]] && ok "non-git shortcut falls through to git_https" || bad "notgit+https rc=$rc $(tailout)"
 
 # smudge token
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
@@ -186,28 +223,59 @@ sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
 (cd "$R" && ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
 [[ $rc -ne 0 ]] && grep -q 'no usable host shortcut' "$T/out" && ok "host_repo name without GIT_HOME or remote fails" || bad "host+noremote rc=$rc $(tailout)"
 
-# unreadable host: report chmod/setfacl, use git_https
-BLOCK="$T/blocked/toy"
-mkdir -p "$T/blocked"
-cp -a "$GH/toy" "$BLOCK"
-chmod a-rx "$BLOCK"
+# blocked ancestor: parent a-x is owner help, not "does not exist"
+ANC="$T/blocked/parent"
+mkdir -p "$ANC"
+cp -a "$GH/toy" "$ANC/toy"
+chmod a-x "$ANC"
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
-sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$BLOCK\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$ANC/toy\"|" "$R/third_party/toy/libpin.toml"
 sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
 fd ro toy; rc=$?
-[[ $rc -eq 0 ]] && grep -q 'chmod a+rX' "$T/out" && grep -q 'setfacl' "$T/out" && grep -q 'chown -R dlang:dlang' "$T/out" && [[ -f "$R/third_party/toy/src/content" ]] && ok "unreadable host reports David chmod and uses git_https" || bad "blocked host rc=$rc $(tailout)"
-chmod u+rwx "$BLOCK"
-chmod -R u+rwx "$T/blocked"
+st_owner=$(stat -c '%U' "$ANC"); st_group=$(stat -c '%G' "$ANC")
+[[ $rc -eq 0 ]] && grep -Fq "blocking component: $ANC (kind ancestor)" "$T/out" \
+  && grep -q "owner=$st_owner group=$st_group" "$T/out" && grep -q "you are $AGENT" "$T/out" \
+  && grep -Fq "owner ($st_owner):" "$T/out" && grep -Fq "chmod g+x $ANC" "$T/out" \
+  && grep -Fq "chmod a+x $ANC" "$T/out" && grep -q 'broad (every user)' "$T/out" \
+  && ! grep -q 'does not exist' "$T/out" && ! grep -q 'chmod -R' "$T/out" && no_own \
+  && [[ -f "$R/third_party/toy/src/content" ]] \
+  && ok "blocked ancestor reports owner help and uses git_https" || bad "blocked ancestor rc=$rc $(tailout)"
+save_sample blocked-ancestor
+restore_comp "$ANC"
 
-# unreadable host, no remote: fail with the same David commands
+# blocked repo dir: recursive rX, default ACL when setfacl exists
+REPOB="$T/blockedrepo"
+rm -rf "$REPOB"
+cp -a "$GH/toy" "$REPOB"
+chmod a-rx "$REPOB"
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
-sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$BLOCK\"|" "$R/third_party/toy/libpin.toml"
-sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
-chmod a-rx "$BLOCK"
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$REPOB\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
 fd ro toy; rc=$?
-[[ $rc -ne 0 ]] && grep -q 'chmod a+rX' "$T/out" && grep -q 'chown -R dlang:dlang' "$T/out" && grep -q 'no usable host shortcut' "$T/out" && ok "unreadable host without remote fails with chmod help" || bad "blocked noremote rc=$rc $(tailout)"
-chmod u+rwx "$BLOCK"
-chmod -R u+rwx "$T/blocked"
+st_owner=$(stat -c '%U' "$REPOB"); st_group=$(stat -c '%G' "$REPOB")
+[[ $rc -eq 0 ]] && grep -Fq "blocking component: $REPOB (kind repo)" "$T/out" \
+  && grep -q "owner=$st_owner group=$st_group" "$T/out" && grep -q "you are $AGENT" "$T/out" \
+  && grep -Fq "owner ($st_owner):" "$T/out" && grep -Fq "chmod -R g+rX $REPOB" "$T/out" \
+  && grep -Fq "chmod -R a+rX $REPOB" "$T/out" && grep -q 'broad (every user)' "$T/out" \
+  && no_own && [[ -f "$R/third_party/toy/src/content" ]] \
+  && ok "blocked repo dir reports recursive rX and uses git_https" || bad "blocked repo rc=$rc $(tailout)"
+if command -v setfacl >/dev/null; then
+  grep -Fq "setfacl -R -d -m u:$AGENT:rX $REPOB" "$T/out" \
+    && ok "blocked repo dir includes default ACL" || bad "blocked repo acl $(tailout)"
+fi
+save_sample blocked-repo
+restore_comp "$REPOB"
+
+# blocked repo, no remote: fail with the same owner help
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$REPOB\"|" "$R/third_party/toy/libpin.toml"
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+chmod a-rx "$REPOB"
+fd ro toy; rc=$?
+[[ $rc -ne 0 ]] && grep -Fq "blocking component: $REPOB (kind repo)" "$T/out" \
+  && grep -q 'no usable host shortcut' "$T/out" && no_own \
+  && ok "blocked repo without remote fails with owner help" || bad "blocked noremote rc=$rc $(tailout)"
+restore_comp "$REPOB"
 
 # git_ssh is a real transport when git_https is absent
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
@@ -235,7 +303,7 @@ sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpi
 fd ro toy; rc=$?
 [[ $rc -eq 0 ]] && grep -q 'does not have' "$T/out" && grep -q 'declared fallback to remote' "$T/out" && grep -q "remote $GH/toy" "$T/out" && grep -q v1 "$R/third_party/toy/src/content" && ok "host missing sha falls through to git_https" || bad "host-miss-sha rc=$rc $(tailout)"
 
-# ssh URL permission/key failure prints a command David can run
+# ssh URL key failure prints ssh -T / git clone; no identity-file help
 mkdir -p "$T/sshbin"
 cat >"$T/sshbin/ssh" <<'EOF'
 #!/bin/bash
@@ -247,7 +315,187 @@ mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
 sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
 sed -i 's|^name = "toy"|name = "toy"\ngit_ssh = "git@invalid.example:toy.git"|' "$R/third_party/toy/libpin.toml"
 (cd "$R" && env PATH="$T/sshbin:$PATH" GIT_SSH="$T/sshbin/ssh" GIT_SSH_COMMAND="$T/sshbin/ssh" ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
-[[ $rc -ne 0 ]] && grep -q 'David: ssh -T git@invalid.example' "$T/out" && grep -q 'David: git clone git@invalid.example:toy.git' "$T/out" && grep -q 'chmod 700 /home/dlang/.ssh' "$T/out" && ok "ssh failure prints David ssh/clone commands" || bad "ssh help rc=$rc $(tailout)"
+[[ $rc -ne 0 ]] && grep -q 'ssh -T git@invalid.example' "$T/out" \
+  && grep -q "git clone git@invalid.example:toy.git $R/third_party/toy/src" "$T/out" \
+  && grep -q 'then:' "$T/out" && grep -q 'SSH_AUTH_SOCK' "$T/out" \
+  && ! grep -q ' -i ' "$T/out" && ! grep -q '.ssh/id_' "$T/out" \
+  && ! grep -q 'GIT_SSH_COMMAND' "$T/out" && ! grep -q 'chmod 700' "$T/out" \
+  && ! grep -q 'known_hosts' "$T/out" && no_own \
+  && ok "ssh key failure prints ssh -T / git clone" || bad "ssh help rc=$rc $(tailout)"
+save_sample ssh-key-failure
+
+# ssh host-key missing (empty HOME known_hosts)
+cat >"$T/sshbin/ssh" <<'EOF'
+#!/bin/bash
+echo "Host key verification failed." >&2
+exit 255
+EOF
+chmod +x "$T/sshbin/ssh"
+HOMED=$(mktemp -d /tmp/libpin-home.XXXXXX)
+mkdir -p "$HOMED/.ssh"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+sed -i 's|^name = "toy"|name = "toy"\ngit_ssh = "git@invalid.example:toy.git"|' "$R/third_party/toy/libpin.toml"
+(cd "$R" && env HOME="$HOMED" PATH="$T/sshbin:$PATH" GIT_SSH="$T/sshbin/ssh" GIT_SSH_COMMAND="$T/sshbin/ssh" ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -Fq "this account (${AGENT})'s known_hosts" "$T/out" \
+  && grep -q 'host key not found in known_hosts' "$T/out" \
+  && grep -q 'ssh-keyscan -H invalid.example >> ~/.ssh/known_hosts' "$T/out" \
+  && grep -q 'verify the fingerprint first' "$T/out" && ! grep -q 'ssh-keygen -R' "$T/out" \
+  && no_own && ok "ssh host-key missing prints append-only keyscan" || bad "ssh hostkey missing rc=$rc $(tailout)"
+save_sample ssh-host-key-missing
+rm -rf "$HOMED"
+
+# ssh host-key changed
+cat >"$T/sshbin/ssh" <<'EOF'
+#!/bin/bash
+echo "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" >&2
+exit 255
+EOF
+chmod +x "$T/sshbin/ssh"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+sed -i 's|^name = "toy"|name = "toy"\ngit_ssh = "git@invalid.example:toy.git"|' "$R/third_party/toy/libpin.toml"
+(cd "$R" && env PATH="$T/sshbin:$PATH" GIT_SSH="$T/sshbin/ssh" GIT_SSH_COMMAND="$T/sshbin/ssh" ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'ssh-keygen -R invalid.example' "$T/out" \
+  && grep -q 'ssh-keyscan -H invalid.example >> ~/.ssh/known_hosts' "$T/out" \
+  && grep -q 'host key changed, verify fingerprint before trusting' "$T/out" \
+  && no_own && ok "ssh host-key changed prints -R then keyscan" || bad "ssh hostkey changed rc=$rc $(tailout)"
+save_sample ssh-host-key-changed
+
+# ssh:// with no user
+cat >"$T/sshbin/ssh" <<'EOF'
+#!/bin/bash
+echo "Permission denied (publickey)." >&2
+exit 255
+EOF
+chmod +x "$T/sshbin/ssh"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+sed -i 's|^name = "toy"|name = "toy"\ngit_ssh = "ssh://invalid.example/toy.git"|' "$R/third_party/toy/libpin.toml"
+(cd "$R" && env PATH="$T/sshbin:$PATH" GIT_SSH="$T/sshbin/ssh" GIT_SSH_COMMAND="$T/sshbin/ssh" ./third_party/fetch-deps --no-bwrap --no-landlock ro toy) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -Fq "ssh:// URL has no user; ssh will use $AGENT" "$T/out" \
+  && grep -q 'ssh -T invalid.example' "$T/out" && no_own \
+  && ok "ssh:// with no user names live account" || bad "ssh nouser rc=$rc $(tailout)"
+save_sample ssh-no-user
+
+# --print-host-perm-suggestions: injected owner/group/mode
+psugg /p repo alice dev 750 "$AGENT" "othergrp" 1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "sudo usermod -aG dev $AGENT" "$T/out" \
+  && grep -q "new login or \`newgrp dev\`" "$T/out" \
+  && ! grep -q 'chmod g+' "$T/out" && ! grep -q 'chmod -R g+' "$T/out" \
+  && order_ok "sudo usermod -aG dev $AGENT" "setfacl -R -m u:$AGENT:rX /p" "broad (every user)" "chmod -R a+rX /p" \
+  && no_own && ok "print suggestions repo 750 not-in-group is (a)(c)(d)" || bad "sugg 750 rc=$rc $(tailout)"
+save_sample agent-not-in-group
+
+psugg /p repo alice dev 700 "$AGENT" "othergrp" 1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "chmod -R g+rX /p" "$T/out" \
+  && order_ok "chmod -R g+rX /p" "sudo usermod -aG dev $AGENT" "setfacl -R -m u:$AGENT:rX /p" "broad (every user)" "chmod -R a+rX /p" \
+  && no_own && ok "print suggestions repo 700 not-in-group is (b)(c)(d)" || bad "sugg 700 rc=$rc $(tailout)"
+
+psugg /p repo alice dev 750 "$AGENT" "dev extra" 1; rc=$?
+[[ $rc -eq 0 ]] && ! grep -q usermod "$T/out" && grep -q 'broad (every user)' "$T/out" \
+  && no_own && ok "print suggestions agent-in-group skips usermod" || bad "sugg in-group rc=$rc $(tailout)"
+
+psugg /home ancestor alice dev 711 "$AGENT" "othergrp" 1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "chmod a+x /home" "$T/out" && ! grep -q -- '-R' "$T/out" \
+  && no_own && ok "print suggestions ancestor has no -R" || bad "sugg ancestor rc=$rc $(tailout)"
+
+psugg /p/file file alice dev 600 "$AGENT" "othergrp" 1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "chmod g+r /p/file" "$T/out" && grep -q "u:$AGENT:r /p/file" "$T/out" \
+  && grep -q "chmod a+r /p/file" "$T/out" && ! grep -q -- '-R' "$T/out" \
+  && no_own && ok "print suggestions file is g+r/:r/a+r without -R" || bad "sugg file rc=$rc $(tailout)"
+
+psugg /p repo alice dev 1755 "$AGENT" "othergrp" 1; rc=$?
+[[ $rc -eq 0 ]] && grep -q "sudo usermod -aG dev $AGENT" "$T/out" && ! grep -q 'chmod g+' "$T/out" \
+  && no_own && ok "print suggestions mode 1755 parsed as 755" || bad "sugg 1755 rc=$rc $(tailout)"
+
+psugg /p file alice dev 600 "$AGENT" "othergrp" 0; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'setfacl is not installed' "$T/out" && ! grep -q 'setfacl -' "$T/out" \
+  && no_own && ok "print suggestions setfacl missing" || bad "sugg nosetfacl rc=$rc $(tailout)"
+save_sample setfacl-missing
+
+psugg /p repo root root 755 "$AGENT" "othergrp" 1; rc=$?
+[[ $rc -eq 0 ]] && no_own && ok "print suggestions owner uid 0 has no chown/chgrp" || bad "sugg uid0 rc=$rc $(tailout)"
+
+psugg a b c d e f g; rc=$?
+[[ $rc -eq 2 ]] && grep -q 'needs 8 arguments' "$T/out" && ok "print suggestions 7 words is rc 2" || bad "sugg 7words rc=$rc $(tailout)"
+
+powner /p toy; rc=$?
+[[ $rc -eq 2 ]] && grep -q 'needs 3 arguments' "$T/out" && ok "print owner-host-perm 2 words is rc 2" || bad "powner 2words rc=$rc $(tailout)"
+
+psugg a b c d e f g h extra; rc=$?
+[[ $rc -eq 2 ]] && grep -q 'takes exactly 8 arguments' "$T/out" && ok "print suggestions extra word is rc 2" || bad "sugg extra rc=$rc $(tailout)"
+
+# unreadable .git file: kind file recipes, no -R
+GF="$T/gitfilehost"
+mkdir -p "$GF"
+echo "gitdir: /nonexistent" >"$GF/.git"
+chmod a-r "$GF/.git"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$GF\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+fd ro toy; rc=$?
+[[ $rc -eq 0 ]] && grep -Fq "blocking component: $GF/.git (kind file)" "$T/out" \
+  && grep -Fq "chmod g+r $GF/.git" "$T/out" && grep -Fq "chmod a+r $GF/.git" "$T/out" \
+  && ! grep -q 'chmod -R' "$T/out" && ! grep -q 'setfacl -R' "$T/out" && no_own \
+  && [[ -f "$R/third_party/toy/src/content" ]] \
+  && ok "unreadable .git file uses file recipes" || bad "gitfile unread rc=$rc $(tailout)"
+save_sample unreadable-git-file
+restore_comp "$GF/.git"
+
+# .git file with relative gitdir: resolved gitdir is walked
+GD="$T/gd"
+mkdir -p "$GD/wt" "$GD/realgit/.git"
+echo "gitdir: ../realgit/.git" >"$GD/wt/.git"
+chmod a-x "$GD/realgit"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$GD/wt\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+fd ro toy; rc=$?
+[[ $rc -eq 0 ]] && grep -Fq "blocking component: $GD/realgit (kind ancestor)" "$T/out" \
+  && grep -Fq "chmod g+x $GD/realgit" "$T/out" && ! grep -q 'chmod -R' "$T/out" && no_own \
+  && ok "relative gitdir is walked" || bad "relative gitdir rc=$rc $(tailout)"
+restore_comp "$GD/realgit"
+
+# .git file without gitdir: line
+NGD="$T/nogitdirhost"
+mkdir -p "$NGD"
+echo "not a gitdir file" >"$NGD/.git"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"$NGD\"|" "$R/third_party/toy/libpin.toml"
+sed -i '/^git_https/d' "$R/third_party/toy/libpin.toml"
+fd ro toy; rc=$?
+[[ $rc -ne 0 ]] && grep -Fq "exists but is not a git repo ('.git' file has no gitdir: line)" "$T/out" \
+  && grep -q 'no usable host shortcut' "$T/out" && no_own \
+  && ok ".git file without gitdir: is a distinct not-a-repo message" || bad "nogitdir rc=$rc $(tailout)"
+save_sample gitfile-no-gitdir
+
+# dubious ownership via print-owner-host-perm
+powner "$GH/toy" toy "fatal: detected dubious ownership in repository at $GH/toy"; rc=$?
+[[ $rc -eq 0 ]] && grep -Fq "path is readable by $AGENT" "$T/out" \
+  && grep -q "git reported dubious ownership" "$T/out" \
+  && grep -Fq -- "-c safe.directory=$GH/toy is already passed" "$T/out" && no_own \
+  && ok "dubious ownership prints already-passed text" || bad "dubious rc=$rc $(tailout)"
+save_sample dubious-ownership
+powner "$GH/toy" toy ""; rc=$?
+[[ $rc -eq 0 ]] && ! grep -q 'dubious ownership' "$T/out" && no_own \
+  && ok "empty git stderr omits dubious-ownership text" || bad "dubious empty rc=$rc $(tailout)"
+
+# rerun line through reenter_self (sandbox binds GIT_HOME)
+mkdir -p "$GH/blk"
+rm -rf "$GH/blk/toy"
+cp -a "$GH/toy" "$GH/blk/toy"
+chmod a-x "$GH/blk"
+mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
+sed -i "s|^name = \"toy\"|name = \"toy\"\nhost_repo = \"blk/toy\"|" "$R/third_party/toy/libpin.toml"
+sed -i "s|git_https = \".*\"|git_https = \"$GH/toy\"|" "$R/third_party/toy/libpin.toml"
+fd_sbx ro toy; rc=$?
+expected=$(printf '%q ' "./third_party/fetch-deps" --git-home "$GH" ro toy)
+expected="${expected% }"
+grep -Fq "then: $expected" "$T/out" && grep -Fq "blocking component: $GH/blk (kind ancestor)" "$T/out" \
+  && no_own && ok "rerun line survives reenter_self" || bad "rerun reentry rc=$rc expected='$expected' $(tailout)"
+save_sample rerun-reentry
+restore_comp "$GH/blk"
 
 # refresh without GIT_HOME uses git_https
 mkrepo false 'printf "built %s\n" "$(cat src/content)" >src/out.bin'
@@ -642,9 +890,9 @@ cp -a "$KIT/." "$EX/"
 (cd "$EX" && ./fetch-deps --no-bwrap --no-landlock ro) >"$T/out" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && ! grep -q '==> example' "$T/out" && ok "example default=false skipped in default set" || bad "example default rc=$rc $(tailout)"
 
-# Host owned by another user: cannot chown without root.
-# Manual: sudo chown ai-code:ai-code /path/to/host && ./fetch-deps --git-home ... ro <pin>
-# Expected: permission/ownership is reported with David chmod/chown/setfacl lines;
+# Host owned by another user with mode 700: this process cannot enter it.
+# Manual: as that owner, chmod g+rX or setfacl, then rerun fetch-deps.
+# Expected: owner help names the blocking component and live stat owner/group;
 # if git_https or git_ssh is set, materialize continues from that URL.
 
 echo "passed $pass failed $fail"
