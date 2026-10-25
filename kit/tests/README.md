@@ -6,7 +6,7 @@ Throwaway `--git-home` fixtures. No network.
 ./kit/tests/run.sh
 ```
 
-Most cases run with `--no-bwrap --no-landlock`. Sandbox cases exercise real bwrap + Landlock.
+Most cases run with `--no-bwrap --no-landlock` (deliberate off switches). Sandbox cases exercise real bwrap + Landlock when present; missing tools are reported and the run continues. `--require-bwrap` / `--require-landlock` (`--require-libpin` is the same as `--require-landlock`) stop if that protection is not available.
 
 Test-only printers (not in `usage()`). The bwrap/Landlock checks still run, so invoke them with `--no-bwrap --no-landlock`. They never read a pin.
 

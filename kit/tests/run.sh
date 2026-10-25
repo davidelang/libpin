@@ -825,16 +825,124 @@ sed -i 's/LIBPIN_VERSION = "2026.10.24"/LIBPIN_VERSION = "1999.01.01"/' "$R/thir
 (cd "$R" && ./third_party/libpin-sandbox --mode lib --lib toy -- true) >"$T/out" 2>&1; rc=$?
 [[ $rc -ne 0 ]] && grep -q 'stamp' "$T/out" && ok "helper stamp mismatch (libpin-sandbox checks landlock)" || bad "ll stamp rc=$rc $(tailout)"
 
-# missing sandbox tools (PATH with common tools but no bwrap)
+# missing sandbox tools (PATH with common tools but no bwrap): continue
 mkrepo false 'true'
 mkdir -p "$T/limited"
-for t in bash sh python3 git curl env sha256sum realpath mktemp cat grep sed awk head tr date chmod mkdir rm cp mv ln ls find sort stat uname id cut basename dirname git-upload-pack git-receive-pack; do
-  if p=$(command -v "$t"); then
+for t in bash sh python3 git curl env sha256sum realpath mktemp cat grep sed awk head tr date chmod mkdir rm cp mv ln ls find sort stat uname id cut basename dirname git-upload-pack git-receive-pack true; do
+  if p=$(type -P "$t"); then
     [[ -e "$T/limited/$t" ]] || ln -s "$p" "$T/limited/$t"
   fi
 done
+ll_rc=0
+ll_live=$("$R/third_party/libpin-landlock" --status 2>&1) || ll_rc=$?
 ( export PATH="$T/limited"; cd "$R" && ./third_party/fetch-deps --git-home "$GH" ro toy ) >"$T/out" 2>&1; rc=$?
-[[ $rc -ne 0 ]] && grep -q 'pass --no-bwrap --no-landlock to run unsandboxed' "$T/out" && ok "missing bwrap is an error" || bad "missing bwrap rc=$rc $(tailout)"
+[[ $rc -eq 0 ]] && grep -q 'bwrap unavailable (bwrap not found on PATH); continuing without it' "$T/out" \
+  && [[ -f "$R/third_party/toy/src/content" ]] \
+  && ok "missing bwrap is reported and the run continues" || bad "missing bwrap rc=$rc $(tailout)"
+if [[ "$ll_rc" -eq 0 ]]; then
+  ll_abi="${ll_live#available }"
+  ll_abi="${ll_abi/=/ }"
+  grep -Fq "Landlock available ($ll_abi); write confinement on" "$T/out" \
+    && ok "missing bwrap still reports live Landlock status" || bad "missing bwrap landlock $(tailout)"
+else
+  grep -q 'Landlock unavailable' "$T/out" \
+    && ok "missing bwrap reports Landlock unavailable to match live --status" || bad "missing bwrap landlock $(tailout)"
+fi
+save_sample sandbox-bwrap-missing
+
+# bwrap installed but failing: fake bwrap on PATH
+mkrepo false 'true'
+mkdir -p "$T/fakebw"
+cat >"$T/fakebw/bwrap" <<'EOF'
+#!/bin/bash
+echo "bwrap: loopback: Permission denied" >&2
+exit 1
+EOF
+chmod +x "$T/fakebw/bwrap"
+( export PATH="$T/fakebw:$PATH"; cd "$R" && ./third_party/fetch-deps --git-home "$GH" ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'bwrap unavailable (bwrap: loopback: Permission denied); continuing without it' "$T/out" \
+  && [[ -f "$R/third_party/toy/src/content" ]] \
+  && ok "failing bwrap is reported and the run continues" || bad "failing bwrap rc=$rc $(tailout)"
+save_sample sandbox-bwrap-failing
+
+# Landlock unavailable; both missing -> none active
+mkrepo false 'true'
+cat >"$R/third_party/libpin-landlock" <<'EOF'
+#!/bin/bash
+LIBPIN_VERSION=2026.10.24
+if [[ "${1:-}" == "--status" ]]; then
+  echo unavailable
+  exit 1
+fi
+echo "libpin-landlock: stub invoked" >&2
+exit 1
+EOF
+chmod +x "$R/third_party/libpin-landlock"
+( cd "$R" && ./third_party/fetch-deps --git-home "$GH" ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'Landlock unavailable (unavailable); continuing without it' "$T/out" \
+  && [[ -f "$R/third_party/toy/src/content" ]] \
+  && ok "Landlock unavailable is reported and the run continues" || bad "ll unavailable rc=$rc $(tailout)"
+save_sample sandbox-landlock-unavailable
+( cd "$R" && ./third_party/fetch-deps --git-home "$GH" --no-bwrap ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'Landlock unavailable (unavailable); continuing without it' "$T/out" \
+  && grep -q 'none active; pin writes are not confined' "$T/out" \
+  && ok "Landlock unavailable with bwrap off is none active" || bad "ll unavailable+nobwrap rc=$rc $(tailout)"
+( export PATH="$T/limited"; cd "$R" && ./third_party/fetch-deps --git-home "$GH" ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'bwrap unavailable (bwrap not found on PATH); continuing without it' "$T/out" \
+  && grep -q 'Landlock unavailable' "$T/out" && grep -q 'none active; pin writes are not confined' "$T/out" \
+  && ok "neither sandbox tool available: none active, rc 0" || bad "neither available rc=$rc $(tailout)"
+save_sample sandbox-neither
+
+# explicit --no-* flags: disabled, not unavailable
+mkrepo false 'true'
+fd ro toy; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'bwrap disabled (--no-bwrap)' "$T/out" \
+  && grep -q 'Landlock disabled (--no-landlock)' "$T/out" \
+  && grep -q 'none active; pin writes are not confined' "$T/out" \
+  && ! grep -q unavailable "$T/out" \
+  && ok "explicit --no-bwrap --no-landlock reports disabled" || bad "disabled flags rc=$rc $(tailout)"
+save_sample sandbox-disabled
+
+# re-entry prints sandbox report once
+mkrepo false 'true'
+fd_sbx ro toy; rc=$?
+sbx_lines=$(grep -c 'libpin: sandbox:' "$T/out" || true)
+[[ $rc -eq 0 ]] && [[ "$sbx_lines" -eq 2 ]] \
+  && grep -q 'bwrap available; write confinement on' "$T/out" \
+  && grep -q 'Landlock available' "$T/out" \
+  && ok "sandbox report appears once through reenter_self" || bad "reentry report rc=$rc lines=$sbx_lines $(tailout)"
+save_sample sandbox-both-available
+
+# libpin-sandbox direct, bwrap missing
+mkrepo false 'true'
+( export PATH="$T/limited"; cd "$R" && ./third_party/libpin-sandbox --mode lib --lib toy -- true ) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'libpin-sandbox: bwrap unavailable (bwrap not found on PATH); continuing without it' "$T/out" \
+  && ok "libpin-sandbox direct continues without bwrap" || bad "sandbox direct rc=$rc $(tailout)"
+
+# --require-bwrap stops when bwrap is missing
+mkrepo false 'true'
+( export PATH="$T/limited"; cd "$R" && ./third_party/fetch-deps --git-home "$GH" --require-bwrap ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'bwrap required (--require-bwrap) but unavailable (bwrap not found on PATH)' "$T/out" \
+  && ok "--require-bwrap stops when bwrap is missing" || bad "require-bwrap rc=$rc $(tailout)"
+
+# --require-libpin / --require-landlock stop when Landlock is missing
+mkrepo false 'true'
+cat >"$R/third_party/libpin-landlock" <<'EOF'
+#!/bin/bash
+LIBPIN_VERSION=2026.10.24
+if [[ "${1:-}" == "--status" ]]; then
+  echo unavailable
+  exit 1
+fi
+exit 1
+EOF
+chmod +x "$R/third_party/libpin-landlock"
+( cd "$R" && ./third_party/fetch-deps --git-home "$GH" --no-bwrap --require-libpin ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'Landlock required (--require-landlock) but unavailable' "$T/out" \
+  && ok "--require-libpin stops when Landlock is missing" || bad "require-libpin rc=$rc $(tailout)"
+( cd "$R" && ./third_party/fetch-deps --git-home "$GH" --require-bwrap --no-bwrap ro toy ) >"$T/out" 2>&1; rc=$?
+[[ $rc -eq 2 ]] && grep -q 'conflicts with --no-bwrap' "$T/out" \
+  && ok "--require-bwrap conflicts with --no-bwrap" || bad "require conflict rc=$rc $(tailout)"
 
 # sandbox denies writes to host .git; LIBPIN_SANDBOX alone does not skip
 mkrepo false 'true'
