@@ -47,7 +47,7 @@ Declared, **loud** fallback (printed at each step). Not a silent/hidden fallback
 - A local host clone (`GIT_HOME` / `host_repo`) is an **optional offline shortcut**, never mandatory.
 - If the shortcut is a readable git repo that has the pin sha, clone from it (no network). An **ambiguous** sha on that host is a hard fail (do not fetch a different commit).
 - Otherwise fetch-deps prints why the shortcut is unused and takes **one** remote: `git_https` if set, else `git_ssh`. A failed `git_https` fetch does not retry `git_ssh`.
-- Unreadable host: print the `chown` / `chmod` / `setfacl` command David can run, then use the remote when set. SSH key failure: print `ssh -T` / `git clone` / `chmod` on `~/.ssh` / `GIT_SSH_COMMAND`.
+- Unreadable host: print the blocking component's owner, group and mode (facts from `stat`) and permission suggestions for a user other than the agent (`chmod` / `setfacl` / `usermod`, never `chown` / `chgrp`), then use the remote when set. SSH failure: print `ssh -T` / `git clone` and observed `SSH_AUTH_SOCK`; host-key errors also print `known_hosts` help. The agent's ssh config picks the key.
 - `source_kind = "seed-src"` is used only when declared and no remote URL is set. Empty `git_https` does not imply it.
 - File `[[source]]` URLs **never** use SSH (`https://`, `http://`, `file:relative`, `file:///abs` only). curl is the only HTTP client.
 
@@ -70,19 +70,26 @@ Declared, **loud** fallback (printed at each step). Not a silent/hidden fallback
 | `host_repo` present, absolute path under `GIT_HOME` | error (use the name) |
 | `host_repo` present, absolute path outside `GIT_HOME` | shortcut if it is a readable git repo; else remote |
 | `host_repo` absent, `GIT_HOME` set, `$GIT_HOME/<pin>` is a readable git repo | that shortcut |
-| `host_repo` absent, path exists but is not git / not readable | skip shortcut, print why (chown/chmod/setfacl if permissions), use remote |
+| `host_repo` absent, path exists but is not git / not readable | skip shortcut, print why (chmod/setfacl if permissions), use remote |
 | `host_repo` absent, `GIT_HOME` unset or path missing | no shortcut; use remote |
 | leftover `@@…@@` token | error |
 
-An unreadable host prints:
+An unreadable host walks the checkout path then the gitdir from the filesystem (no `git rev-parse` until that walk passes). A strict prefix needs execute only (`ancestor`); the checkout dir or gitdir directory needs read+execute (`repo`); a `.git` file needs read (`file`). Help names the first blocked component, states its owner/group/mode, and prints every applicable fix, narrowest first: group membership or group bits, then `setfacl` (or `setfacl is not installed`), then world. It never suggests `chown` or `chgrp`. The rerun line is the outer invocation (`then:`).
 
 ```text
-David: chmod a+rX <host> && chmod -R a+rX <host>/.git
-or:    setfacl -R -m u:<agent>:rx <host>
-or:    chown -R dlang:dlang <host> && chmod -R a+rX <host>
+fetch-deps: host shortcut <path> is not readable (you are <agent>)
+  Host is an optional offline shortcut. A git_https or git_ssh URL will be used when set.
+  blocking component: <component> (kind repo) owner=<owner> group=<group> mode=<mode>
+  owner (<owner>):
+    sudo usermod -aG <group> <agent>
+    setfacl -R -m u:<agent>:rX <component>
+    setfacl -R -d -m u:<agent>:rX <component>
+    broad (every user)
+    chmod -R a+rX <component>
+  then: <original argv>
 ```
 
-An SSH failure prints `ssh -T`, `git clone <git_ssh> <src>`, `chmod` on `~/.ssh`, and an example `GIT_SSH_COMMAND=ssh -i …` for David.
+An SSH failure prints `ssh -T [-p port] <user@host>`, `git clone <git_ssh> <src>`, `SSH_AUTH_SOCK` as observed, and the rerun line. An `ssh://` URL with no user says ssh will use `<id -un>`. Host-key errors add `this account (<agent>)'s known_hosts` and `ssh-keyscan` (append-only, or `-R` then keyscan when the host key changed). The user's ssh config and agent pick the key.
 
 Materialize from a host is `git clone --no-hardlinks --no-checkout` then `checkout --detach <sha>`. Linked worktrees and clones with alternates (`--shared`) are replaced. `origin` is `git_https` or `git_ssh`; remote `host` is the resolved path when the shortcut exists.
 
@@ -251,7 +258,7 @@ fetch-deps then leaves `src` writable after materialize (still a git tree at the
 | `rw` | `work` | `--branch NAME` |
 | `upgrade` | `upgrade/<ref>` | `--branch NAME` |
 
-Branches exist only in `src`. Agents never push to the host. On success, upgrade deletes the branch and detaches at the new pin. On failure, src and its branch are kept for debugging. Print for David: `git -C <src> push host HEAD:refs/heads/<branch>`.
+Branches exist only in `src`. Agents never push to the host. On success, upgrade deletes the branch and detaches at the new pin. On failure, src and its branch are kept for debugging. Print for the owner: `owner (<host owner>): git -C <src> push host HEAD:refs/heads/<branch>` (`<host owner>` from `stat` on the usable host).
 
 `status.local` has no `ve_branch` field.
 

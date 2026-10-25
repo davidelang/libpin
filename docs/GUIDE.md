@@ -68,7 +68,7 @@ third_party/
 # edit under third_party/<lib>/src
 ./third_party/fetch-deps build <lib>
 # bump pin when ready: libpin.toml + artifact/ + commit on the app branch
-# David: git -C third_party/<lib>/src push host HEAD:refs/heads/work
+# owner: git -C third_party/<lib>/src push host HEAD:refs/heads/work
 ```
 
 ### Materialize-only (file pins, pure sources)
@@ -84,7 +84,7 @@ build = []
 
 ### Local full clone (`GIT_HOME`)
 
-Optional offline shortcut, never mandatory. Declared loud fallback: usable host, else `git_https`, else `git_ssh`. Each step is printed. A failed HTTPS fetch does not retry SSH. If the host is missing or unreadable, fetch-deps prints the `chown` / `chmod` / `setfacl` / `ssh` command David can run and uses the remote URL. Linked worktrees and `--shared` (alternates) src trees are replaced. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
+Optional offline shortcut, never mandatory. Declared loud fallback: usable host, else `git_https`, else `git_ssh`. Each step is printed. A failed HTTPS fetch does not retry SSH. If the host is missing or unreadable, fetch-deps prints why, with `chmod` / `setfacl` / `ssh` commands a user other than the agent can run (never `chown` / `chgrp`), and uses the remote URL. Linked worktrees and `--shared` (alternates) src trees are replaced. A leftover `@@GIT_HOME@@` token is an error. See [PIN_FORMAT.md](PIN_FORMAT.md) for the decision tree.
 
 ---
 

@@ -304,7 +304,7 @@ libpin’s sandbox is **hardening for pin tooling**, not a multi-tenant VM bound
 **Good at:**
 
 - Stopping accidental `rm -rf` / write spray into the rest of the monorepo during materialize/build
-- Denying writes into host clones under `GIT_HOME` (agents are `ai-*`; hosts are `dlang:dlang`)
+- Denying writes into host clones under `GIT_HOME` (those trees are typically owned by a user other than the agent)
 - Reducing blast radius of a compromised or buggy upstream build script against the app tree
 - Making “what can this step write?” explicit in code (modes)
 
