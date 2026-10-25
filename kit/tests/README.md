@@ -20,6 +20,6 @@ Test-only printers (not in `usage()`). The bwrap/Landlock checks still run, so i
   --print-owner-host-perm PATH NAME STDERR
 ```
 
-`KIND` is `ancestor`, `repo`, or `file`. `SETFACL_OK` is `0` or `1`. Fewer arguments is a usage error (exit 2).
+`KIND` is `ancestor`, `repo`, or `file`. `SETFACL_OK` is `0` or `1`. Wrong count (too few or too many) is a usage error (exit 2) with `takes exactly N arguments (got M)`. A valid print still needs `--no-bwrap --no-landlock`.
 
 The host-owned-by-another-user case (mode 700, a uid this process is not) is a manual probe at the end of `run.sh`.
